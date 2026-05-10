@@ -1666,6 +1666,26 @@ def _apply_setting_change(
         return True  # signal to break
     if entry == "__SEPARATOR__":
         return False
+    if entry == "__AUTO_DETECT__":
+        try:
+            hardware = detect_hardware()
+            recommendations = recommend_flags(hardware)
+            text = Path(SERVICE_FILE).read_text()
+            for key, val in recommendations.items():
+                str_val = str(val).lower() if isinstance(val, bool) else str(val)
+                text = write_setting(text, key, str_val)
+            Path(SERVICE_FILE).write_text(text)
+            current_settings.clear()
+            current_settings.update(read_all_settings(text))
+            show_message(
+                stdscr,
+                "Auto-Detect & Recommend",
+                ["Settings applied!"]
+                + [f"  {k} = {v}" for k, v in recommendations.items()],
+            )
+        except Exception as e:
+            show_message(stdscr, "Error", [f"Auto-detect failed: {e}"])
+        return False
     current_val = current_settings.get(entry.key, entry.default)
     try:
         if use_toggle:
@@ -1705,6 +1725,7 @@ def run_auto_restart_settings(stdscr) -> None:
     selected = 0
     display_entries: list[Any] = list(SETTINGS)
     display_entries.append("__SEPARATOR__")
+    display_entries.append("__AUTO_DETECT__")
     display_entries.append(None)  # sentinel for "Back"
 
     while True:
@@ -1734,6 +1755,19 @@ def run_auto_restart_settings(stdscr) -> None:
 
             if entry == "__SEPARATOR__":
                 stdscr.addstr(y, 2, "─" * 48)
+                continue
+
+            if entry == "__AUTO_DETECT__":
+                cursor = ">" if i == selected else " "
+                line = f"{cursor}   ⚡ Auto-Detect & Recommend"
+                if i == selected:
+                    stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+                    stdscr.addstr(y, 2, line[: cols - 2])
+                    stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+                else:
+                    stdscr.attron(curses.color_pair(COL_GREEN))
+                    stdscr.addstr(y, 2, line[: cols - 2])
+                    stdscr.attroff(curses.color_pair(COL_GREEN))
                 continue
 
             current_str = str(current_settings.get(entry.key, entry.default))
