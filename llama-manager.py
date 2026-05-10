@@ -10,37 +10,39 @@ import re
 import subprocess
 import time
 import glob
-import csv
-import urllib.request
-import json
 import threading
 import logging
 from pathlib import Path
 from collections import deque
-from typing import Dict, Any, List, Optional, Tuple, Deque
+from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 
 SERVICE_NAME = "llama.service"
 SERVICE_FILE = f"/etc/systemd/system/{SERVICE_NAME}"
 LOG_FILE = Path.home() / ".llama-manager.log"
 
-logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 
 _REAL_USER = os.environ.get("SUDO_USER") or os.environ.get("USER") or "root"
 _REAL_HOME = Path(f"/home/{_REAL_USER}") if _REAL_USER != "root" else Path("/root")
-GGUF_DIR   = _REAL_HOME / ".gguf"
+GGUF_DIR = _REAL_HOME / ".gguf"
 
 MENU = [
-    ("Watch Mode",      "watch"),
-    ("Journal",         "logs"),
+    ("Watch Mode", "watch"),
+    ("Journal", "logs"),
     ("Journal (Pager)", "journal"),
     ("Restart & Timeout Settings", "auto_restart_settings"),
-    ("Start",           "start"),
-    ("Stop",            "stop"),
-    ("Restart",         "restart"),
-    ("Reset Error",     "reset_error"),
-    ("Quit",            "quit"),
+    ("Start", "start"),
+    ("Stop", "stop"),
+    ("Restart", "restart"),
+    ("Reset Error", "reset_error"),
+    ("Quit", "quit"),
 ]
+
 
 @dataclass
 class Setting:
@@ -52,50 +54,300 @@ class Setting:
     options: list = field(default_factory=list)
     description: str = ""
 
+
 # Auto-restart settings registry - each entry becomes a submenu item
 SETTINGS: List[Setting] = [
-    Setting("ngl_start", "GPU Layers (-ngl)", "-ngl", "int", 0, description="Number of GPU layers to offload"),
-    Setting("ngl_step", "NGL Decrement Per Retry", "", "int", 1, description="How much to reduce -ngl each retry"),
-    Setting("retry_on_oom", "Retry on OOM Crash", "", "bool", False, description="Auto-retry with lower -ngl after OOM"),
-    Setting("ctx_start", "Context Size (-c)", "-c", "int", 2048, description="Context window size in tokens"),
-    Setting("ctx_step", "Context Decrement Per Retry", "", "int", 2048, description="How much to reduce -c each retry"),
-    Setting("enable_ctx_reduction", "Enable Context Reduction", "", "bool", True, description="Reduce context when ngl reaches 0"),
-    Setting("ctx_reduction_pct", "Context Reduction %", "", "int", 12, description="Percentage to reduce context per retry"),
-    Setting("hang_timeout_mins", "Hang Detection Timeout (min)", "", "int", 15, description="Minutes without response before declaring hang"),
-    Setting("stagnation_timeout_mins", "Log Stagnation Timeout (min)", "", "int", 5, description="Minutes without log output before declaring stuck"),
-    Setting("oom_detection_timeout_secs", "OOM Detection Timeout (sec)", "", "int", 30, description="Seconds after restart to detect OOM crash"),
-    Setting("auto_recovery_enabled", "Auto-Recovery Enabled", "", "bool", True, description="Master toggle for automated recovery"),
-
-    Setting("host", "Host Address", "--host", "string", "127.0.0.1", description="Network interface to bind to"),
+    Setting(
+        "ngl_start",
+        "GPU Layers (-ngl)",
+        "-ngl",
+        "int",
+        0,
+        description="Number of GPU layers to offload",
+    ),
+    Setting(
+        "ngl_step",
+        "NGL Decrement Per Retry",
+        "",
+        "int",
+        1,
+        description="How much to reduce -ngl each retry",
+    ),
+    Setting(
+        "retry_on_oom",
+        "Retry on OOM Crash",
+        "",
+        "bool",
+        False,
+        description="Auto-retry with lower -ngl after OOM",
+    ),
+    Setting(
+        "ctx_start",
+        "Context Size (-c)",
+        "-c",
+        "int",
+        2048,
+        description="Context window size in tokens",
+    ),
+    Setting(
+        "ctx_step",
+        "Context Decrement Per Retry",
+        "",
+        "int",
+        2048,
+        description="How much to reduce -c each retry",
+    ),
+    Setting(
+        "enable_ctx_reduction",
+        "Enable Context Reduction",
+        "",
+        "bool",
+        True,
+        description="Reduce context when ngl reaches 0",
+    ),
+    Setting(
+        "ctx_reduction_pct",
+        "Context Reduction %",
+        "",
+        "int",
+        12,
+        description="Percentage to reduce context per retry",
+    ),
+    Setting(
+        "hang_timeout_mins",
+        "Hang Detection Timeout (min)",
+        "",
+        "int",
+        15,
+        description="Minutes without response before declaring hang",
+    ),
+    Setting(
+        "stagnation_timeout_mins",
+        "Log Stagnation Timeout (min)",
+        "",
+        "int",
+        5,
+        description="Minutes without log output before declaring stuck",
+    ),
+    Setting(
+        "oom_detection_timeout_secs",
+        "OOM Detection Timeout (sec)",
+        "",
+        "int",
+        30,
+        description="Seconds after restart to detect OOM crash",
+    ),
+    Setting(
+        "auto_recovery_enabled",
+        "Auto-Recovery Enabled",
+        "",
+        "bool",
+        True,
+        description="Master toggle for automated recovery",
+    ),
+    Setting(
+        "host",
+        "Host Address",
+        "--host",
+        "string",
+        "127.0.0.1",
+        description="Network interface to bind to",
+    ),
     Setting("port", "Port", "--port", "int", 8080, description="Server listening port"),
-    Setting("server_timeout", "Server Timeout (sec)", "--timeout", "int", 600, description="HTTP server read timeout"),
-    Setting("threads", "CPU Threads (-t)", "-t", "int", 0, options=[], description="Number of CPU threads (0=auto)"),
-    Setting("threads_batch", "Batch Threads (-tb)", "-tb", "int", 0, description="Number of batch processing threads (0=auto)"),
-    Setting("batch_size", "Batch Size (-b)", "-b", "int", 2048, description="Prompt processing batch size"),
-    Setting("ubatch_size", "Micro Batch Size (-ub)", "-ub", "int", 512, description="Physical batch size for token generation"),
-    Setting("mlock", "mlock (Lock RAM)", "--mlock", "bool", False, description="Lock model in RAM against swapping"),
-    Setting("flash_attn", "Flash Attention", "--flash-attn", "enum", "auto", options=["on", "off", "auto", "1", "0"], description="Use flash attention"),
-    Setting("cache_type_k", "K Cache Type", "-ctk", "enum", "f16", options=["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"], description="Key cache quantization type"),
-    Setting("cache_type_v", "V Cache Type", "-ctv", "enum", "f16", options=["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"], description="Value cache quantization type"),
-    Setting("cache_ram", "CPU Cache RAM (MB)", "--cache-ram", "int", 8192, description="CPU cache RAM limit in MB"),
-    Setting("parallel_slots", "Parallel Slots (-np)", "-np", "int", 0, description="Max parallel request slots (0=auto)"),
-    Setting("model_path", "Model Path (-m)", "-m", "string", "", description="Path to GGUF model file"),
-    Setting("no_kv_offload", "No KV Offload", "--no-kv-offload", "bool", False, description="Disable KV cache offload to GPU"),
-    Setting("reasoning_budget", "Reasoning Budget", "--reasoning-budget", "int", -1, description="Token budget for thinking (-1=unrestricted)"),
-    Setting("spec_type", "Speculative Type", "--spec-type", "enum", "none", options=["none", "mtp", "ngram-cache", "ngram-simple", "ngram-map-k", "ngram-map-k4v", "ngram-mod"], description="Speculative decoding type"),
-    Setting("no_mmap", "No Memory Map", "--no-mmap", "bool", False, description="Disable memory-mapped model loading"),
-    Setting("alias", "Model Alias", "-a", "string", "", description="Model name alias for API"),
-    Setting("watch_log_lines", "Watch Log Lines", "", "int", 6, description="Number of recent log entries shown in watch mode"),
+    Setting(
+        "server_timeout",
+        "Server Timeout (sec)",
+        "--timeout",
+        "int",
+        600,
+        description="HTTP server read timeout",
+    ),
+    Setting(
+        "threads",
+        "CPU Threads (-t)",
+        "-t",
+        "int",
+        0,
+        options=[],
+        description="Number of CPU threads (0=auto)",
+    ),
+    Setting(
+        "threads_batch",
+        "Batch Threads (-tb)",
+        "-tb",
+        "int",
+        0,
+        description="Number of batch processing threads (0=auto)",
+    ),
+    Setting(
+        "batch_size",
+        "Batch Size (-b)",
+        "-b",
+        "int",
+        2048,
+        description="Prompt processing batch size",
+    ),
+    Setting(
+        "ubatch_size",
+        "Micro Batch Size (-ub)",
+        "-ub",
+        "int",
+        512,
+        description="Physical batch size for token generation",
+    ),
+    Setting(
+        "mlock",
+        "mlock (Lock RAM)",
+        "--mlock",
+        "bool",
+        False,
+        description="Lock model in RAM against swapping",
+    ),
+    Setting(
+        "flash_attn",
+        "Flash Attention",
+        "--flash-attn",
+        "enum",
+        "auto",
+        options=["on", "off", "auto", "1", "0"],
+        description="Use flash attention",
+    ),
+    Setting(
+        "cache_type_k",
+        "K Cache Type",
+        "-ctk",
+        "enum",
+        "f16",
+        options=[
+            "f32",
+            "f16",
+            "bf16",
+            "q8_0",
+            "q4_0",
+            "q4_1",
+            "iq4_nl",
+            "q5_0",
+            "q5_1",
+        ],
+        description="Key cache quantization type",
+    ),
+    Setting(
+        "cache_type_v",
+        "V Cache Type",
+        "-ctv",
+        "enum",
+        "f16",
+        options=[
+            "f32",
+            "f16",
+            "bf16",
+            "q8_0",
+            "q4_0",
+            "q4_1",
+            "iq4_nl",
+            "q5_0",
+            "q5_1",
+        ],
+        description="Value cache quantization type",
+    ),
+    Setting(
+        "cache_ram",
+        "CPU Cache RAM (MB)",
+        "--cache-ram",
+        "int",
+        8192,
+        description="CPU cache RAM limit in MB",
+    ),
+    Setting(
+        "parallel_slots",
+        "Parallel Slots (-np)",
+        "-np",
+        "int",
+        0,
+        description="Max parallel request slots (0=auto)",
+    ),
+    Setting(
+        "model_path",
+        "Model Path (-m)",
+        "-m",
+        "string",
+        "",
+        description="Path to GGUF model file",
+    ),
+    Setting(
+        "no_kv_offload",
+        "No KV Offload",
+        "--no-kv-offload",
+        "bool",
+        False,
+        description="Disable KV cache offload to GPU",
+    ),
+    Setting(
+        "reasoning_budget",
+        "Reasoning Budget",
+        "--reasoning-budget",
+        "int",
+        -1,
+        description="Token budget for thinking (-1=unrestricted)",
+    ),
+    Setting(
+        "spec_type",
+        "Speculative Type",
+        "--spec-type",
+        "enum",
+        "none",
+        options=[
+            "none",
+            "mtp",
+            "ngram-cache",
+            "ngram-simple",
+            "ngram-map-k",
+            "ngram-map-k4v",
+            "ngram-mod",
+        ],
+        description="Speculative decoding type",
+    ),
+    Setting(
+        "no_mmap",
+        "No Memory Map",
+        "--no-mmap",
+        "bool",
+        False,
+        description="Disable memory-mapped model loading",
+    ),
+    Setting(
+        "alias",
+        "Model Alias",
+        "-a",
+        "string",
+        "",
+        description="Model name alias for API",
+    ),
+    Setting(
+        "watch_log_lines",
+        "Watch Log Lines",
+        "",
+        "int",
+        6,
+        description="Number of recent log entries shown in watch mode",
+    ),
 ]
 
 
-_JOURNAL_PREFIX = re.compile(r'^\w{3}\s+\d+\s+[\d:]+\s+\S+\s+\S+\[\d+\]:\s*')
+_JOURNAL_PREFIX = re.compile(r"^\w{3}\s+\d+\s+[\d:]+\s+\S+\s+\S+\[\d+\]:\s*")
 _LLAMA_MANAGER_META_PREFIX = "# llama-manager:"
-_OOM_PATTERNS = ("out of memory", "cuda error: out of memory", "oom", "cannot meet free memory target", "failed to fit params")
+_OOM_PATTERNS = (
+    "out of memory",
+    "cuda error: out of memory",
+    "oom",
+    "cannot meet free memory target",
+    "failed to fit params",
+)
 
 # ---------------------------------------------------------------------------
 # Global State & Workers
 # ---------------------------------------------------------------------------
+
 
 class GlobalState:
     def __init__(self):
@@ -103,137 +355,287 @@ class GlobalState:
         self.ram, self.vram, self.prog = "N/A", "N/A", "Idle"
         self.meta, self.ngl, self.ctx, self.slots = {}, 0, 0, {}
         self.is_ready = False
-        self.loading_since = None
-        self.last_log_ts = None
+        self.loading_since: Optional[float] = None
+        self.last_log_ts: Optional[float] = None
         self.last_log_msg = ""
         self.oom_seen = False
-        self.critical_error = None
+        self.critical_error: Optional[str] = None
         self.last_manual_reset = 0.0
         self.wrap_mode = True
         self.lock = threading.Lock()
 
     def refresh(self):
-        s = "RUNNING" if _run(["systemctl", "is-active", "--quiet", SERVICE_NAME]).returncode == 0 else "STOPPED"
+        s = (
+            "RUNNING"
+            if _run(["systemctl", "is-active", "--quiet", SERVICE_NAME]).returncode == 0
+            else "STOPPED"
+        )
         r, v = get_ram(), get_vram()
         try:
             t = Path(SERVICE_FILE).read_text()
-            m, n, c = _read_all_meta(t), _extract_execstart_ngl(t), _extract_execstart_ctx(t)
-        except Exception: m, n, c = {}, 0, 0
-        
+            m, n, c = (
+                _read_all_meta(t),
+                _extract_execstart_ngl(t),
+                _extract_execstart_ctx(t),
+            )
+        except Exception:
+            m, n, c = {}, 0, 0
+
         with self.lock:
-            self.service_status, self.ram, self.vram, self.meta, self.ngl, self.ctx = s, r, v, m, n, c
-            if self.meta.get("auto_recovery_enabled", "true") == "false": return
-            if self.critical_error: return
-            if time.time() - self.last_manual_reset < 5: return
+            self.service_status, self.ram, self.vram, self.meta, self.ngl, self.ctx = (
+                s,
+                r,
+                v,
+                m,
+                n,
+                c,
+            )
+            if self.meta.get("auto_recovery_enabled", "true") == "false":
+                return
+            if self.critical_error:
+                return
+            if time.time() - self.last_manual_reset < 5:
+                return
 
             if self.oom_seen:
-                self._trigger_recovery("OOM Crash"); self.oom_seen = False; return
+                self._trigger_recovery("OOM Crash")
+                self.oom_seen = False
+                return
 
             if s == "RUNNING" and not self.is_ready:
                 now = time.time()
-                if self.loading_since is None: self.loading_since = now
-                if (now - self.loading_since) / 60 >= int(self.meta.get("hang_timeout_mins", 15)):
-                    self._trigger_recovery("Loading Timeout"); return
-                if self.last_log_ts and (now - self.last_log_ts) / 60 >= int(self.meta.get("stagnation_timeout_mins", 5)):
-                    self._trigger_recovery(f"Log Stagnation (Stuck at: {self.last_log_msg[:30]})")
-            else: self.loading_since = None
+                if self.loading_since is None:
+                    self.loading_since = now
+                if (now - self.loading_since) / 60 >= int(
+                    self.meta.get("hang_timeout_mins", 15)
+                ):
+                    self._trigger_recovery("Loading Timeout")
+                    return
+                if self.last_log_ts and (now - self.last_log_ts) / 60 >= int(
+                    self.meta.get("stagnation_timeout_mins", 5)
+                ):
+                    self._trigger_recovery(
+                        f"Log Stagnation (Stuck at: {self.last_log_msg[:30]})"
+                    )
+            else:
+                self.loading_since = None
 
     def _trigger_recovery(self, reason: str):
         if self.ngl == 0 and self.meta.get("enable_ctx_reduction", "true") == "false":
-            self.critical_error = f"CRITICAL FAILURE: {reason}. Manual Intervention Required."
-            logging.warning(f"Recovery blocked: {reason}, ngl=0, ctx reduction disabled")
+            self.critical_error = (
+                f"CRITICAL FAILURE: {reason}. Manual Intervention Required."
+            )
+            logging.warning(
+                f"Recovery blocked: {reason}, ngl=0, ctx reduction disabled"
+            )
             return
 
         updates = {"last_recovery_reason": reason}
-        if "OOM" in reason: 
-            updates["oom_restart_count"] = int(self.meta.get("oom_restart_count", 0)) + 1
-        else: 
-            updates["hang_recovery_count"] = int(self.meta.get("hang_recovery_count", 0)) + 1
-        
+        if "OOM" in reason:
+            updates["oom_restart_count"] = (
+                int(self.meta.get("oom_restart_count", 0)) + 1
+            )
+        else:
+            updates["hang_recovery_count"] = (
+                int(self.meta.get("hang_recovery_count", 0)) + 1
+            )
+
         ngl_step = int(self.meta.get("ngl_decrement_step", 1))
         if self.ngl > 0:
             updates["ngl_start"] = max(0, self.ngl - ngl_step)
-            logging.info(f"Recovery: {reason}, decrementing ngl {self.ngl} -> {updates['ngl_start']}")
+            logging.info(
+                f"Recovery: {reason}, decrementing ngl {self.ngl} -> {updates['ngl_start']}"
+            )
         else:
             reduction_pct = float(self.meta.get("ctx_reduction_pct", 12.5)) / 100.0
             new_ctx = max(2048, self.ctx - max(2048, int(self.ctx * reduction_pct)))
-            if new_ctx != self.ctx: 
+            if new_ctx != self.ctx:
                 updates["ctx_start"] = new_ctx
-                logging.info(f"Recovery: {reason}, reducing ctx {self.ctx} -> {new_ctx}")
-            else: 
-                self.critical_error = f"CRITICAL FAILURE: {reason}. All automated recovery exhausted."
-                logging.error(f"Recovery exhausted: {reason}, ngl=0, ctx stuck at {self.ctx}")
+                logging.info(
+                    f"Recovery: {reason}, reducing ctx {self.ctx} -> {new_ctx}"
+                )
+            else:
+                self.critical_error = (
+                    f"CRITICAL FAILURE: {reason}. All automated recovery exhausted."
+                )
+                logging.error(
+                    f"Recovery exhausted: {reason}, ngl=0, ctx stuck at {self.ctx}"
+                )
 
         _write_all_meta(updates)
         daemon_reload_if_needed()
         _run(["systemctl", "restart", SERVICE_NAME])
         self.loading_since = self.last_log_ts = None
 
+
 gs = GlobalState()
+
 
 class LogManager:
     def __init__(self, max_lines=5000):
         self.raw_logs, self.cursor = deque(maxlen=max_lines), None
-        self.lock, self.stop_event, self.new_data_event = threading.Lock(), threading.Event(), threading.Event()
+        self.lock, self.stop_event, self.new_data_event = (
+            threading.Lock(),
+            threading.Event(),
+            threading.Event(),
+        )
+
     def start(self):
         self.new_data_event.set()
         threading.Thread(target=self._worker, daemon=True).start()
+
     def _worker(self):
         sc = self._get_last_start_cursor()
-        cmd = ["journalctl", "-u", SERVICE_NAME, "--after-cursor", sc, "-o", "short-iso", "--show-cursor", "--no-pager"] if sc else \
-              ["journalctl", "-u", SERVICE_NAME, "-n", "500", "-o", "short-iso", "--show-cursor", "--no-pager"]
+        cmd = (
+            [
+                "journalctl",
+                "-u",
+                SERVICE_NAME,
+                "--after-cursor",
+                sc,
+                "-o",
+                "short-iso",
+                "--show-cursor",
+                "--no-pager",
+            ]
+            if sc
+            else [
+                "journalctl",
+                "-u",
+                SERVICE_NAME,
+                "-n",
+                "500",
+                "-o",
+                "short-iso",
+                "--show-cursor",
+                "--no-pager",
+            ]
+        )
         self._fetch(cmd)
         while not self.stop_event.is_set():
-            cmd = ["journalctl", "-u", SERVICE_NAME, "--after-cursor", self.cursor, "-o", "short-iso", "--show-cursor", "--no-pager"] if self.cursor else \
-                  ["journalctl", "-u", SERVICE_NAME, "-n", "100", "-o", "short-iso", "--show-cursor", "--no-pager"]
-            if self._fetch(cmd): self.new_data_event.set(); self._update_gs()
+            cmd = (
+                [
+                    "journalctl",
+                    "-u",
+                    SERVICE_NAME,
+                    "--after-cursor",
+                    self.cursor,
+                    "-o",
+                    "short-iso",
+                    "--show-cursor",
+                    "--no-pager",
+                ]
+                if self.cursor
+                else [
+                    "journalctl",
+                    "-u",
+                    SERVICE_NAME,
+                    "-n",
+                    "100",
+                    "-o",
+                    "short-iso",
+                    "--show-cursor",
+                    "--no-pager",
+                ]
+            )
+            if self._fetch(cmd):
+                self.new_data_event.set()
+                self._update_gs()
             self.stop_event.wait(1.5)
+
     def _get_last_start_cursor(self) -> Optional[str]:
         try:
-            out = _run(["journalctl", "-u", SERVICE_NAME, "MESSAGE=Started llama.service.", "-n", "1", "-o", "short-iso", "--show-cursor", "--no-pager"], capture_output=True, text=True).stdout
+            out = _run(
+                [
+                    "journalctl",
+                    "-u",
+                    SERVICE_NAME,
+                    "MESSAGE=Started llama.service.",
+                    "-n",
+                    "1",
+                    "-o",
+                    "short-iso",
+                    "--show-cursor",
+                    "--no-pager",
+                ],
+                capture_output=True,
+                text=True,
+            ).stdout
             for l in out.splitlines():
-                if l.startswith("-- cursor:"): return l.split(": ")[1].strip()
-        except Exception: pass
+                if l.startswith("-- cursor:"):
+                    return l.split(": ")[1].strip()
+        except Exception:
+            pass
         return None
+
     def _fetch(self, cmd: List[str]) -> bool:
         try:
             out = _run(cmd, capture_output=True, text=True, timeout=5).stdout
             added, last_line, oom_found = False, "", False
             for l in out.strip().splitlines():
-                if l.startswith("-- cursor:"): self.cursor = l.split(": ")[1].strip()
+                if l.startswith("-- cursor:"):
+                    self.cursor = l.split(": ")[1].strip()
                 elif l.strip() and not l.startswith("-- "):
                     clean = strip_journal_prefix(l)
-                    with self.lock: self.raw_logs.append(clean); added, last_line = True, clean
-                    if any(p in clean.lower() for p in _OOM_PATTERNS): oom_found = True
+                    with self.lock:
+                        self.raw_logs.append(clean)
+                        added, last_line = True, clean
+                    if any(p in clean.lower() for p in _OOM_PATTERNS):
+                        oom_found = True
             if added:
                 with gs.lock:
                     gs.last_log_msg, gs.last_log_ts = last_line, time.time()
-                    if oom_found: gs.oom_seen = True
+                    if oom_found:
+                        gs.oom_seen = True
             return added
-        except Exception: return False
+        except Exception:
+            return False
+
     def _update_gs(self):
-        with self.lock: recent = list(self.raw_logs)[-200:]
+        with self.lock:
+            recent = list(self.raw_logs)[-200:]
         slots, prog, ready = {}, "Idle", False
         for l in reversed(recent):
-            if any(x in l for x in ("HTTP server is listening", "srv  log_server_r")): ready = True; break
-            if "warming up the model" in l: prog = "Warming Up..."; break
-            if "load_tensors" in l: prog = "Loading Tensors..."; break
+            if any(x in l for x in ("HTTP server is listening", "srv  log_server_r")):
+                ready = True
+                break
+            if "warming up the model" in l:
+                prog = "Warming Up..."
+                break
+            if "load_tensors" in l:
+                prog = "Loading Tensors..."
+                break
         for l in recent:
             if "slot update_slots" in l and "progress =" in l:
-                ms, mt, mp = re.search(r"id\s+(\d+)", l), re.search(r"task\s+(\d+)", l), re.search(r"progress\s*=\s*([0-9.]+)", l)
+                ms, mt, mp = (
+                    re.search(r"id\s+(\d+)", l),
+                    re.search(r"task\s+(\d+)", l),
+                    re.search(r"progress\s*=\s*([0-9.]+)", l),
+                )
                 if ms and mt and mp:
-                    slots[ms.group(1)] = {"task": mt.group(1), "prog": float(mp.group(1))}
-                    if not ready: prog = f"{float(mp.group(1)) * 100:.1f}%"
-        with gs.lock: gs.slots, gs.prog, gs.is_ready = slots, prog, ready
+                    slots[ms.group(1)] = {
+                        "task": mt.group(1),
+                        "prog": float(mp.group(1)),
+                    }
+                    if not ready:
+                        prog = f"{float(mp.group(1)) * 100:.1f}%"
+        with gs.lock:
+            gs.slots, gs.prog, gs.is_ready = slots, prog, ready
+
 
 lm = LogManager()
 
+
 def status_worker():
-    while True: gs.refresh(); time.sleep(2)
+    while True:
+        gs.refresh()
+        time.sleep(2)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _service_env() -> dict:
     return {**os.environ, "TZ": "Europe/Berlin"}
@@ -251,7 +653,9 @@ def _aggressive_cleanup() -> None:
         "echo 3 | sudo tee /proc/sys/vm/drop_caches && "
         "sleep 5"
     )
-    subprocess.run(cmd, shell=True, check=True, env=_service_env(), capture_output=True, text=True)
+    subprocess.run(
+        cmd, shell=True, check=True, env=_service_env(), capture_output=True, text=True
+    )
 
 
 def _aggressive_service_action(action: str) -> None:
@@ -263,15 +667,27 @@ def _aggressive_service_action(action: str) -> None:
 
     cmd = f"sudo systemctl daemon-reload && sudo systemctl {action} {SERVICE_NAME}"
     try:
-        subprocess.run(cmd, shell=True, check=True, env=_service_env(), capture_output=True, text=True)
+        subprocess.run(
+            cmd,
+            shell=True,
+            check=True,
+            env=_service_env(),
+            capture_output=True,
+            text=True,
+        )
     except subprocess.CalledProcessError as e:
-        logging.error(f"Aggressive service {action} failed (rc={e.returncode}): {e.stderr}")
+        logging.error(
+            f"Aggressive service {action} failed (rc={e.returncode}): {e.stderr}"
+        )
         raise
 
 
 def strip_journal_prefix(line: str) -> str:
     # Handle short-iso format: "2026-05-09T02:15:24+0000 hostname process[pid]: message"
-    iso_match = re.match(r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2})\s+\S+\s+\S+\[\d+\]:\s*(.*)', line)
+    iso_match = re.match(
+        r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2})\s+\S+\s+\S+\[\d+\]:\s*(.*)",
+        line,
+    )
     if iso_match:
         ts, msg = iso_match.group(1), iso_match.group(2)
         # Extract only HH:MM from "2026-05-09T02:15:24+0000"
@@ -279,26 +695,32 @@ def strip_journal_prefix(line: str) -> str:
         return f"{time_only} | {msg}"
     # Fallback for other formats
     m = _JOURNAL_PREFIX.match(line)
-    if not m: return line.strip()
-    prefix, ts_m = m.group(0), re.match(r'^(\w{3})\s+(\d+)\s+([\d:]+)', line)
+    if not m:
+        return line.strip()
+    prefix, ts_m = m.group(0), re.match(r"^(\w{3})\s+(\d+)\s+([\d:]+)", line)
     if ts_m:
-        day, hms = ts_m.group(2).zfill(2), ts_m.group(3).split(':')
-        if len(hms) >= 2: return f"{day} {hms[0]}:{hms[1]} | {line[len(prefix):].strip()}"
-    return line[len(prefix):].strip()
+        day, hms = ts_m.group(2).zfill(2), ts_m.group(3).split(":")
+        if len(hms) >= 2:
+            return f"{day} {hms[0]}:{hms[1]} | {line[len(prefix) :].strip()}"
+    return line[len(prefix) :].strip()
 
 
 def _fmt_bytes(b: int) -> str:
-    for unit in ('B', 'Ki', 'Mi', 'Gi', 'Ti'):
-        if abs(b) < 1024:
-            return f"{b:.0f}{unit}"
-        b /= 1024
-    return f"{b:.1f}Pi"
+    val: float = b
+    for unit in ("B", "Ki", "Mi", "Gi", "Ti"):
+        if abs(val) < 1024:
+            return f"{val:.0f}{unit}"
+        val /= 1024
+    return f"{val:.1f}Pi"
 
 
 def _read_all_meta(text: str) -> Dict[str, str]:
     meta: Dict[str, str] = {}
     for line in text.splitlines():
-        m = re.match(rf'^\s*{re.escape(_LLAMA_MANAGER_META_PREFIX)}\s*(\w+)\s*=\s*(.+?)\s*$', line)
+        m = re.match(
+            rf"^\s*{re.escape(_LLAMA_MANAGER_META_PREFIX)}\s*(\w+)\s*=\s*(.+?)\s*$",
+            line,
+        )
         if m:
             meta[m.group(1)] = m.group(2).strip()
     return meta
@@ -307,10 +729,10 @@ def _read_all_meta(text: str) -> Dict[str, str]:
 def _extract_execstart_ngl(text: str) -> int:
     for line in text.splitlines():
         if line.lstrip().startswith("ExecStart="):
-            m = re.search(r'(^|\s)-ngl\s+(\d+)\b', line)
+            m = re.search(r"(^|\s)-ngl\s+(\d+)\b", line)
             if m:
                 return int(m.group(2))
-    m = re.search(r'(^|\s)-ngl\s+(\d+)\b', text, flags=re.M)
+    m = re.search(r"(^|\s)-ngl\s+(\d+)\b", text, flags=re.M)
     if m:
         return int(m.group(2))
     return 0
@@ -319,10 +741,10 @@ def _extract_execstart_ngl(text: str) -> int:
 def _extract_execstart_ctx(text: str) -> int:
     for line in text.splitlines():
         if line.lstrip().startswith("ExecStart="):
-            m = re.search(r'(^|\s)-c\s+(\d+)\b', line)
+            m = re.search(r"(^|\s)-c\s+(\d+)\b", line)
             if m:
                 return int(m.group(2))
-    m = re.search(r'(^|\s)-c\s+(\d+)\b', text, flags=re.M)
+    m = re.search(r"(^|\s)-c\s+(\d+)\b", text, flags=re.M)
     if m:
         return int(m.group(2))
     return 0
@@ -334,9 +756,11 @@ def _write_all_meta(updates: Dict[str, Any]) -> None:
     new_lines: List[str] = []
     updated_keys = set()
     for line in lines:
-        m = re.match(rf'^\s*{re.escape(_LLAMA_MANAGER_META_PREFIX)}\s*(\w+)\s*=', line)
+        m = re.match(rf"^\s*{re.escape(_LLAMA_MANAGER_META_PREFIX)}\s*(\w+)\s*=", line)
         if m and m.group(1) in updates:
-            new_lines.append(f"{_LLAMA_MANAGER_META_PREFIX} {m.group(1)}={updates[m.group(1)]}")
+            new_lines.append(
+                f"{_LLAMA_MANAGER_META_PREFIX} {m.group(1)}={updates[m.group(1)]}"
+            )
             updated_keys.add(m.group(1))
         else:
             new_lines.append(line)
@@ -348,17 +772,31 @@ def _write_all_meta(updates: Dict[str, Any]) -> None:
                 break
         for key, value in updates.items():
             if key not in updated_keys:
-                new_lines.insert(insert_pos, f"{_LLAMA_MANAGER_META_PREFIX} {key}={value}")
+                new_lines.insert(
+                    insert_pos, f"{_LLAMA_MANAGER_META_PREFIX} {key}={value}"
+                )
                 insert_pos += 1
     new_text = "\n".join(new_lines)
     if text.endswith("\n"):
         new_text += "\n"
     if "ngl_start" in updates:
         val = int(updates["ngl_start"])
-        new_text, _ = re.subn(r"(^ExecStart=.*?-\s*ngl\s+)\d+\b", rf"\g<1>{val}", new_text, count=1, flags=re.M)
+        new_text, _ = re.subn(
+            r"(^ExecStart=.*?-\s*ngl\s+)\d+\b",
+            rf"\g<1>{val}",
+            new_text,
+            count=1,
+            flags=re.M,
+        )
     if "ctx_start" in updates:
         val = int(updates["ctx_start"])
-        new_text, _ = re.subn(r"(^ExecStart=.*?-\s*c\s+)\d+\b", rf"\g<1>{val}", new_text, count=1, flags=re.M)
+        new_text, _ = re.subn(
+            r"(^ExecStart=.*?-\s*c\s+)\d+\b",
+            rf"\g<1>{val}",
+            new_text,
+            count=1,
+            flags=re.M,
+        )
     Path(SERVICE_FILE).write_text(new_text)
 
 
@@ -371,7 +809,9 @@ def _normalize_execstart(text: str) -> str:
         if line.lstrip().startswith("ExecStart="):
             in_execstart = True
             result.append(line.rstrip("\n"))
-        elif in_execstart and line.startswith((" ", "\t")) and result[-1].endswith("\\"):
+        elif (
+            in_execstart and line.startswith((" ", "\t")) and result[-1].endswith("\\")
+        ):
             result[-1] = result[-1][:-1] + " " + line.strip()
         else:
             in_execstart = False
@@ -379,7 +819,9 @@ def _normalize_execstart(text: str) -> str:
     return "\n".join(result)
 
 
-def _extract_execstart_flag(text: str, flag: str, expect_value: bool = True) -> Optional[str]:
+def _extract_execstart_flag(
+    text: str, flag: str, expect_value: bool = True
+) -> Optional[str]:
     """Extract a flag's value from ExecStart line.
     Handles: -flag VALUE, --flag=VALUE, --flag 1/0, --flag
     Returns the value as string, or None if not found.
@@ -391,12 +833,12 @@ def _extract_execstart_flag(text: str, flag: str, expect_value: bool = True) -> 
         if not line_stripped.startswith("ExecStart="):
             continue
         # Match: -flag VALUE or --flag VALUE or --flag=VALUE
-        m = re.search(r'(?:^|\s)' + re.escape(flag) + r'[=\s]+(\S+)', line)
+        m = re.search(r"(?:^|\s)" + re.escape(flag) + r"[=\s]+(\S+)", line)
         if m:
             return m.group(1)
         # Match standalone boolean flag: --flag (no value after)
         if not expect_value:
-            m = re.search(r'(?:^|\s)' + re.escape(flag) + r'(?:\s|$)', line)
+            m = re.search(r"(?:^|\s)" + re.escape(flag) + r"(?:\s|$)", line)
             if m:
                 return "true"
     return None
@@ -405,6 +847,7 @@ def _extract_execstart_flag(text: str, flag: str, expect_value: bool = True) -> 
 # ---------------------------------------------------------------------------
 # Hardware Detection
 # ---------------------------------------------------------------------------
+
 
 def detect_cpu_count():
     """Return the number of CPU cores available."""
@@ -429,9 +872,9 @@ def detect_vram_info():
         used = 0
     free = total - used
     return {
-        "total_gib": round(total / (1024 ** 3), 2),
-        "used_gib": round(used / (1024 ** 3), 2),
-        "free_gib": round(free / (1024 ** 3), 2),
+        "total_gib": round(total / (1024**3), 2),
+        "used_gib": round(used / (1024**3), 2),
+        "free_gib": round(free / (1024**3), 2),
     }
 
 
@@ -453,9 +896,9 @@ def detect_ram_info():
         available = 0
     used = total - available
     return {
-        "total_gib": round(total / (1024 ** 3), 2),
-        "available_gib": round(available / (1024 ** 3), 2),
-        "used_gib": round(used / (1024 ** 3), 2),
+        "total_gib": round(total / (1024**3), 2),
+        "available_gib": round(available / (1024**3), 2),
+        "used_gib": round(used / (1024**3), 2),
     }
 
 
@@ -490,20 +933,20 @@ def detect_hardware():
     }
 
 
-def recommend_flags(hardware):
+def recommend_flags(hardware: Dict[str, Any]) -> Dict[str, Any]:
     """Recommend optimal llama-server flag values based on detected hardware.
-    
+
     Args:
         hardware: dict from detect_hardware()
-    
+
     Returns:
         dict mapping setting key -> recommended value
     """
-    cpu = hardware.get("cpu_count", 1)
-    vram_free = hardware.get("vram_free_gib", 0)
-    ram_total = hardware.get("ram_total_gib", 0)
-    ram_available = hardware.get("ram_available_gib", 0)
-    gpu_type = hardware.get("gpu_type", "none")
+    cpu: int = hardware.get("cpu_count", 1)
+    vram_free: float = hardware.get("vram_free_gib", 0)
+    ram_total: float = hardware.get("ram_total_gib", 0)
+    ram_available: float = hardware.get("ram_available_gib", 0)
+    gpu_type: str = hardware.get("gpu_type", "none")
 
     ngl = 0
     if vram_free >= 6:
@@ -537,7 +980,7 @@ def recommend_flags(hardware):
     elif vram_free >= 2:
         parallel = 2
 
-    rec = {}
+    rec: dict[str, Any] = {}
     for s in SETTINGS:
         s_default = s.default
         if s.key == "ngl_start":
@@ -571,14 +1014,16 @@ def read_all_settings(text: str) -> Dict[str, Any]:
             val = meta[s.key]
         # Try ExecStart flag if the setting maps to one
         elif s.flag:
-            exec_val = _extract_execstart_flag(text, s.flag, expect_value=(s.type != "bool"))
+            exec_val = _extract_execstart_flag(
+                text, s.flag, expect_value=(s.type != "bool")
+            )
             if exec_val is not None:
                 val = exec_val
             else:
                 val = s.default
         else:
             val = s.default
-        
+
         # Cast to correct type
         if s.type == "int":
             try:
@@ -592,7 +1037,7 @@ def read_all_settings(text: str) -> Dict[str, Any]:
                 result[s.key] = _parse_bool(str(val))
         else:
             result[s.key] = str(val) if val is not None else s.default
-    
+
     return result
 
 
@@ -608,66 +1053,96 @@ def write_setting(text: str, key: str, value: str) -> str:
             break
     if setting is None:
         raise ValueError(f"Unknown setting: {key}")
-    
+
     lines = text.splitlines()
     new_lines: List[str] = []
     meta_updated = False
     execstart_pos = None
-    
+
     for i, line in enumerate(lines):
         # Update existing meta comment
         if line.lstrip().startswith(_LLAMA_MANAGER_META_PREFIX):
-            m = re.match(r'^' + re.escape(_LLAMA_MANAGER_META_PREFIX) + r'\s*(\w+)\s*=', line)
+            m = re.match(
+                r"^" + re.escape(_LLAMA_MANAGER_META_PREFIX) + r"\s*(\w+)\s*=", line
+            )
             if m and m.group(1) == key:
                 new_lines.append(f"{_LLAMA_MANAGER_META_PREFIX} {key}={value}")
                 meta_updated = True
                 continue
-        
+
         # Track ExecStart position
         if line.lstrip().startswith("ExecStart="):
             execstart_pos = i
-        
+
         new_lines.append(line)
-    
+
     # If meta comment didn't exist, insert it before ExecStart
     if not meta_updated and execstart_pos is not None:
         new_lines.insert(execstart_pos, f"{_LLAMA_MANAGER_META_PREFIX} {key}={value}")
         execstart_pos += 1
-    
+
     new_text = "\n".join(new_lines)
     if text.endswith("\n"):
         new_text += "\n"
-    
+
     # Update ExecStart flag if this setting maps to one
     if setting.flag:
+        if value == "":
+            # Remove flag entirely when value is empty (user chose to disable)
+            new_text = re.sub(
+                r"\s+" + re.escape(setting.flag) + r"(?:[=\s]+\S+)?",
+                "",
+                new_text,
+                count=0,
+            )
+            # Also remove meta comment for this key
+            meta_pattern = (
+                r"^"
+                + re.escape(_LLAMA_MANAGER_META_PREFIX)
+                + r"\s*"
+                + re.escape(key)
+                + r"\s*=.*$\n?"
+            )
+            new_text = re.sub(meta_pattern, "", new_text, flags=re.MULTILINE)
+            return new_text
         if setting.type == "bool":
             is_true = _parse_bool(value)
-            pattern = r'(?:^|\s)' + re.escape(setting.flag) + r'(?:[=\s]+\S+)?'
+            pattern = r"(?:^|\s)" + re.escape(setting.flag) + r"(?:[=\s]+\S+)?"
             has_flag = bool(re.search(pattern, new_text, re.M))
             if is_true and not has_flag:
                 new_text = re.sub(
-                    r'(ExecStart=.*?)(\n|\\n|\s*\\)',
-                    lambda m: m.group(1) + ' ' + setting.flag + ' 1' + m.group(2),
-                    new_text, count=1
+                    r"(ExecStart=.*?)(\n|\\n|\s*\\)",
+                    lambda m: m.group(1) + " " + setting.flag + " 1" + m.group(2),
+                    new_text,
+                    count=1,
                 )
             elif not is_true and has_flag:
                 new_text = re.sub(
-                    r'\s+' + re.escape(setting.flag) + r'(?:[=\s]+\S+)?',
-                    '', new_text, count=1
+                    r"\s+" + re.escape(setting.flag) + r"(?:[=\s]+\S+)?",
+                    "",
+                    new_text,
+                    count=1,
                 )
         else:
             flag_value = str(value)
-            old_pattern = r'(' + re.escape(setting.flag) + r'[=\s]+)\S+'
+            old_pattern = r"(" + re.escape(setting.flag) + r"[=\s]+)\S+"
             old_text = new_text
-            new_text = re.sub(old_pattern, r'\g<1>' + flag_value, new_text, count=1)
+            new_text = re.sub(old_pattern, r"\g<1>" + flag_value, new_text, count=1)
             if new_text == old_text:
                 # Flag not found in ExecStart — normalize multi-line then append
                 new_text = _normalize_execstart(new_text)
-                execstart_pattern = r'^(ExecStart=.*?)(\s*)$'
+                execstart_pattern = r"^(ExecStart=.*?)(\s*)$"
                 m = re.search(execstart_pattern, new_text, re.M)
                 if m:
-                    new_text = new_text[:m.end(1)] + ' ' + setting.flag + ' ' + flag_value + new_text[m.end(2):]
-    
+                    new_text = (
+                        new_text[: m.end(1)]
+                        + " "
+                        + setting.flag
+                        + " "
+                        + flag_value
+                        + new_text[m.end(2) :]
+                    )
+
     return new_text
 
 
@@ -692,11 +1167,11 @@ def get_vram() -> str:
         has_tot = False
         for file in files:
             with open(file) as f:
-                total_used += int(f.read().strip()) / 1024 ** 3
+                total_used += int(f.read().strip()) / 1024**3
             tot_path = file.replace("used", "total")
             if os.path.exists(tot_path):
                 with open(tot_path) as f:
-                    total_tot += int(f.read().strip()) / 1024 ** 3
+                    total_tot += int(f.read().strip()) / 1024**3
                 has_tot = True
         if has_tot:
             return f"{total_used:.2f}/{total_tot:.2f}GiB"
@@ -718,7 +1193,10 @@ def read_ngl_retry_settings(text: str) -> Dict[str, Any]:
         "oom_detection_timeout_secs": 30,
     }
     for line in text.splitlines():
-        m = re.match(rf'^\s*{re.escape(_LLAMA_MANAGER_META_PREFIX)}\s*(\w+)\s*=\s*(.+?)\s*$', line)
+        m = re.match(
+            rf"^\s*{re.escape(_LLAMA_MANAGER_META_PREFIX)}\s*(\w+)\s*=\s*(.+?)\s*$",
+            line,
+        )
         if not m:
             continue
         key, value = m.group(1), m.group(2)
@@ -750,14 +1228,18 @@ def is_oom_like_failure(text: str) -> bool:
 
 def rewrite_ngl_retry_settings(text: str, settings: Dict[str, Any]) -> str:
     existing_meta = _read_all_meta(text)
-    merged_meta = {**existing_meta,
-                   "ngl_start": str(settings["ngl_start"]),
-                   "ngl_step": str(settings["ngl_step"]),
-                   "retry_on_oom": "true" if settings.get("retry_on_oom", True) else "false"}
+    merged_meta = {
+        **existing_meta,
+        "ngl_start": str(settings["ngl_start"]),
+        "ngl_step": str(settings["ngl_step"]),
+        "retry_on_oom": "true" if settings.get("retry_on_oom", True) else "false",
+    }
     if "hang_timeout_mins" in settings:
         merged_meta["hang_timeout_mins"] = str(settings["hang_timeout_mins"])
     if "oom_detection_timeout_secs" in settings:
-        merged_meta["oom_detection_timeout_secs"] = str(settings["oom_detection_timeout_secs"])
+        merged_meta["oom_detection_timeout_secs"] = str(
+            settings["oom_detection_timeout_secs"]
+        )
 
     lines = text.splitlines()
     new_lines: List[str] = []
@@ -776,7 +1258,9 @@ def rewrite_ngl_retry_settings(text: str, settings: Dict[str, Any]) -> str:
     new_text = "\n".join(new_lines)
     if text.endswith("\n"):
         new_text += "\n"
-    new_text, count = re.subn(r'(-ngl\s+)\d+\b', rf'\g<1>{int(settings["ngl_start"])}', new_text, count=1)
+    new_text, count = re.subn(
+        r"(-ngl\s+)\d+\b", rf"\g<1>{int(settings['ngl_start'])}", new_text, count=1
+    )
     if count == 0:
         raise ValueError("Could not find -ngl in service file")
     return new_text
@@ -791,7 +1275,8 @@ def daemon_reload_if_needed() -> None:
     try:
         out = subprocess.run(
             ["systemctl", "show", SERVICE_NAME, "--property=NeedDaemonReload"],
-            capture_output=True, text=True
+            capture_output=True,
+            text=True,
         ).stdout.strip()
         if out == "NeedDaemonReload=yes":
             subprocess.run(["systemctl", "daemon-reload"], check=False)
@@ -817,7 +1302,7 @@ def remove_stale_flags(text: str) -> str:
     lines = text.splitlines()
     clean_lines: List[str] = []
     for line in lines:
-        m = re.match(rf'^\s*{re.escape(_LLAMA_MANAGER_META_PREFIX)}\s*(\w+)\s*=', line)
+        m = re.match(rf"^\s*{re.escape(_LLAMA_MANAGER_META_PREFIX)}\s*(\w+)\s*=", line)
         if m and m.group(1) not in known_keys:
             continue  # Skip stale meta comment
         clean_lines.append(line)
@@ -827,8 +1312,8 @@ def remove_stale_flags(text: str) -> str:
     for line in clean_lines:
         if line.lstrip().startswith("ExecStart="):
             eq_pos = line.index("=")
-            prefix = line[:eq_pos + 1]  # "ExecStart="
-            rest = line[eq_pos + 1:]
+            prefix = line[: eq_pos + 1]  # "ExecStart="
+            rest = line[eq_pos + 1 :]
             tokens = rest.split()
             new_tokens: List[str] = []
             skip_next = False
@@ -849,7 +1334,11 @@ def remove_stale_flags(text: str) -> str:
                     else:
                         # Unknown flag — skip it and its value (if separate token)
                         previous_was_value_flag = False
-                        if "=" not in token and i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
+                        if (
+                            "=" not in token
+                            and i + 1 < len(tokens)
+                            and not tokens[i + 1].startswith("-")
+                        ):
                             skip_next = True
                 else:
                     new_tokens.append(token)
@@ -868,64 +1357,127 @@ def remove_stale_flags(text: str) -> str:
 # UI Components & View Modes
 # ---------------------------------------------------------------------------
 
-COL_BAR, COL_SEL, COL_NORMAL, COL_GREEN, COL_RED, COL_PURPLE, COL_YELLOW, COL_CYAN, COL_SELBG = range(1, 10)
+(
+    COL_BAR,
+    COL_SEL,
+    COL_NORMAL,
+    COL_GREEN,
+    COL_RED,
+    COL_PURPLE,
+    COL_YELLOW,
+    COL_CYAN,
+    COL_SELBG,
+) = range(1, 10)
+
 
 def draw_status_bar(stdscr, cols):
     with gs.lock:
-        s, r, v, p, n, ready, err = gs.service_status, gs.ram, gs.vram, gs.prog, gs.ngl, gs.is_ready, gs.critical_error
-        ctx, o, l, h = gs.ctx, gs.meta.get("oom_restart_count", "0"), gs.meta.get("loop_restart_count", "0"), gs.meta.get("hang_recovery_count", "0")
-    
+        s, r, v, p, n, ready, err = (
+            gs.service_status,
+            gs.ram,
+            gs.vram,
+            gs.prog,
+            gs.ngl,
+            gs.is_ready,
+            gs.critical_error,
+        )
+        ctx, o, l, h = (
+            gs.ctx,
+            gs.meta.get("oom_restart_count", "0"),
+            gs.meta.get("loop_restart_count", "0"),
+            gs.meta.get("hang_recovery_count", "0"),
+        )
+
     if err:
         stdscr.attron(curses.color_pair(COL_RED) | curses.A_BOLD)
-        try: stdscr.addstr(0, 0, err.center(cols)); stdscr.addstr(1, 0, "Press 'r' to reset error state".center(cols))
-        except curses.error: pass
+        try:
+            stdscr.addstr(0, 0, err.center(cols))
+            stdscr.addstr(1, 0, "Press 'r' to reset error state".center(cols))
+        except curses.error:
+            pass
         stdscr.attroff(curses.color_pair(COL_RED) | curses.A_BOLD)
         return
 
     def ln(y, lt, rt):
         al = max(0, cols - len(rt))
         stdscr.attron(curses.color_pair(COL_BAR) | curses.A_BOLD)
-        try: stdscr.addstr(y, 0, (lt[:al].ljust(al) + rt)[:cols])
-        except curses.error: pass
+        try:
+            stdscr.addstr(y, 0, (lt[:al].ljust(al) + rt)[:cols])
+        except curses.error:
+            pass
         stdscr.attroff(curses.color_pair(COL_BAR) | curses.A_BOLD)
-    ln(0, f" llama.service [{s}] | ngl: {n} | ctx: {ctx} | OOM: {o} | Loop: {l} | Hang: {h}", f" RAM: {r} ")
-    ln(1, f" Status: {p}" + (" [LOADING]" if not ready and s == "RUNNING" else ""), f" VRAM: {v} ")
+
+    ln(
+        0,
+        f" llama.service [{s}] | ngl: {n} | ctx: {ctx} | OOM: {o} | Loop: {l} | Hang: {h}",
+        f" RAM: {r} ",
+    )
+    ln(
+        1,
+        f" Status: {p}" + (" [LOADING]" if not ready and s == "RUNNING" else ""),
+        f" VRAM: {v} ",
+    )
+
 
 def run_logs(stdscr):
-    stdscr.clear(); stdscr.timeout(100); stdscr.idlok(True); stdscr.idcok(True)
+    stdscr.clear()
+    stdscr.timeout(100)
+    stdscr.idlok(True)
+    stdscr.idcok(True)
     sp, hs, lc, lw, p, dl = -1, 0, -1, None, None, []
     while True:
-        rows, cols = stdscr.getmaxyx(); vh = rows - 4
-        with gs.lock: wr = gs.wrap_mode
+        rows, cols = stdscr.getmaxyx()
+        vh = rows - 4
+        with gs.lock:
+            wr = gs.wrap_mode
         if cols != lc or wr != lw or lm.new_data_event.is_set():
-            if cols != lc: stdscr.clear()
-            lm.new_data_event.clear(); lc, lw, dl = cols, wr, []
-            with lm.lock: raw = list(lm.raw_logs)
+            if cols != lc:
+                stdscr.clear()
+            lm.new_data_event.clear()
+            lc, lw, dl = cols, wr, []
+            with lm.lock:
+                raw = list(lm.raw_logs)
             max_w = cols
             for r in raw:
                 if wr:
-                    for s in range(0, len(r), cols - 1): dl.append(r[s:s+cols-1])
-                else: dl.append(r); max_w = max(max_w, len(r) + 5)
+                    for s in range(0, len(r), cols - 1):
+                        dl.append(r[s : s + cols - 1])
+                else:
+                    dl.append(r)
+                    max_w = max(max_w, len(r) + 5)
             p = curses.newpad(max(len(dl), vh + 1), max_w)
             for i, l in enumerate(dl):
-                try: p.addstr(i, 0, l)
-                except curses.error: pass
+                try:
+                    p.addstr(i, 0, l)
+                except curses.error:
+                    pass
         k = stdscr.getch()
-        if k in (ord('q'), ord('Q')): break
-        elif k == ord('r'): gs.critical_error = None
-        elif k == curses.KEY_UP: sp = max(0, (sp if sp != -1 else len(dl) - vh) - 1)
-        elif k == curses.KEY_DOWN: sp = sp + 1 if sp != -1 else -1; sp = -1 if sp >= len(dl) - vh else sp
-        elif k == curses.KEY_LEFT: hs = max(0, hs - 5)
-        elif k == curses.KEY_RIGHT: hs += 5
-        elif k in (ord('w'), ord('W')):
-            with gs.lock: gs.wrap_mode = not gs.wrap_mode; wr = gs.wrap_mode
+        if k in (ord("q"), ord("Q")):
+            break
+        elif k == ord("r"):
+            gs.critical_error = None
+        elif k == curses.KEY_UP:
+            sp = max(0, (sp if sp != -1 else len(dl) - vh) - 1)
+        elif k == curses.KEY_DOWN:
+            sp = sp + 1 if sp != -1 else -1
+            sp = -1 if sp >= len(dl) - vh else sp
+        elif k == curses.KEY_LEFT:
+            hs = max(0, hs - 5)
+        elif k == curses.KEY_RIGHT:
+            hs += 5
+        elif k in (ord("w"), ord("W")):
+            with gs.lock:
+                gs.wrap_mode = not gs.wrap_mode
+                wr = gs.wrap_mode
             lm.new_data_event.set()
         draw_status_bar(stdscr, cols)
         as_ = max(0, len(dl) - vh) if sp == -1 else min(sp, max(0, len(dl) - vh))
         stdscr.noutrefresh()
-        if p and hasattr(p, 'pnoutrefresh'):
-            try: p.pnoutrefresh(as_, hs if not wr else 0, 3, 0, 3 + vh - 1, cols - 1)
-            except curses.error: pass
+        if p and hasattr(p, "pnoutrefresh"):
+            try:
+                p.pnoutrefresh(as_, hs if not wr else 0, 3, 0, 3 + vh - 1, cols - 1)  # type: ignore[attr-defined]
+            except curses.error:
+                pass
         curses.doupdate()
 
 
@@ -945,7 +1497,7 @@ def show_message(stdscr, title: str, lines: List[str], wait_key: bool = True) ->
         if 4 + i >= rows - 1:
             break
         try:
-            stdscr.addstr(4 + i, 0, line[:cols - 1])
+            stdscr.addstr(4 + i, 0, line[: cols - 1])
         except curses.error:
             pass
     if wait_key:
@@ -977,14 +1529,14 @@ def _prompt_input(stdscr, title: str, prompt: str, initial: str = "") -> Optiona
             stdscr.attroff(curses.color_pair(COL_PURPLE) | curses.A_BOLD)
             stdscr.addstr(4, 0, prompt[:cols])
             stdscr.addstr(6, 0, "> ")
-            stdscr.addstr(6, 2, value[:max(0, cols - 3)])
+            stdscr.addstr(6, 2, value[: max(0, cols - 3)])
             stdscr.addstr(rows - 1, 0, " Enter = confirm    Esc = cancel "[:cols])
             stdscr.move(6, min(cols - 1, 2 + len(value)))
             stdscr.refresh()
             key = stdscr.getch()
             if key == 27:
                 return None
-            elif key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
+            elif key in (curses.KEY_ENTER, ord("\n"), ord("\r")):
                 return value.strip()
             elif key in (curses.KEY_BACKSPACE, 127, 8):
                 value = value[:-1]
@@ -997,23 +1549,34 @@ def _prompt_input(stdscr, title: str, prompt: str, initial: str = "") -> Optiona
         stdscr.timeout(1000)
 
 
-
 def _prompt_setting(stdscr, setting: Setting, current_value: Any) -> Optional[str]:
     """Prompt user for a new value for a setting."""
     if setting.type == "bool":
-        new_val = "false" if str(current_value).lower() in ("true", "1", "yes") else "true"
+        new_val = (
+            "false" if str(current_value).lower() in ("true", "1", "yes") else "true"
+        )
         return new_val
     elif setting.type == "int":
-        result = _prompt_input(stdscr, "Restart & Timeout Settings",
-                               f"Enter new {setting.key}:", str(current_value))
-        return result
+        return _prompt_input(
+            stdscr,
+            "Restart & Timeout Settings",
+            f"Enter new {setting.key} (empty=disable):",
+            str(current_value),
+        )
     elif setting.type == "string":
-        return _prompt_input(stdscr, setting.label, setting.label + ":", str(current_value))
+        return _prompt_input(
+            stdscr,
+            setting.label,
+            setting.label + " (empty=disable):",
+            str(current_value),
+        )
     elif setting.type == "enum":
         options = setting.options
         if not options:
             return str(current_value)
-        current_idx = options.index(str(current_value)) if str(current_value) in options else 0
+        current_idx = (
+            options.index(str(current_value)) if str(current_value) in options else 0
+        )
         new_idx = (current_idx + 1) % len(options)
         new_value = options[new_idx]
         # Visual feedback for cycling
@@ -1033,98 +1596,75 @@ def run_auto_restart_settings(stdscr) -> None:
     except Exception as e:
         show_message(stdscr, "Settings Error", [f"Failed to read service file: {e}"])
         return
-    
+
     selected = 0
-    display_entries = list(SETTINGS)
+    display_entries: list[Any] = list(SETTINGS)
     display_entries.append("__SEPARATOR__")
-    display_entries.append("__AUTO_DETECT__")
     display_entries.append(None)  # sentinel for "Back"
-    
+
     while True:
         stdscr.erase()
         rows, cols = stdscr.getmaxyx()
-        
+
         title = "=== Restart & Timeout Settings ==="
         stdscr.attron(curses.color_pair(1))
         stdscr.addstr(0, max(0, (cols - len(title)) // 2), title)
         stdscr.attroff(curses.color_pair(1))
-        
+
         stdscr.addstr(2, 2, f"{'Setting':30s} {'Value':>15s}")
         stdscr.addstr(3, 2, "-" * 48)
-        
+
         visible_count = min(rows - 6, len(display_entries))
         start_idx = max(0, selected - visible_count // 2)
         end_idx = min(start_idx + visible_count, len(display_entries))
-        
+
         for i in range(start_idx, end_idx):
             y = 4 + i - start_idx
             entry = display_entries[i]
-            
+
             if entry is None:
                 indicator = " <-" if i == selected else "   "
                 stdscr.addstr(y, 2, f"[q] Back to main menu{indicator}")
                 continue
-            
+
             if entry == "__SEPARATOR__":
                 stdscr.addstr(y, 2, "─" * 48)
                 continue
-            
-            if entry == "__AUTO_DETECT__":
-                prefix = " > " if i == selected else "   "
-                line = f"{prefix}⚡ Auto-Detect & Recommend"
-                if i == selected:
-                    stdscr.attron(curses.color_pair(1))
-                    stdscr.addstr(y, 2, line[:cols-2])
-                    stdscr.attroff(curses.color_pair(1))
-                else:
-                    stdscr.addstr(y, 2, line[:cols-2])
-                continue
-            
+
             current_str = str(current_settings.get(entry.key, entry.default))
             if entry.type == "bool":
-                display_val = "enabled" if str(current_str).lower() in ("true", "1", "yes") else "disabled"
+                display_val = (
+                    "enabled"
+                    if str(current_str).lower() in ("true", "1", "yes")
+                    else "disabled"
+                )
             else:
                 display_val = current_str
-            
+
             prefix = " > " if i == selected else "   "
             line = f"{prefix}{entry.key:30s} {display_val:>15s}"
             if i == selected:
                 stdscr.attron(curses.color_pair(1))
-                stdscr.addstr(y, 2, line[:cols-2])
+                stdscr.addstr(y, 2, line[: cols - 2])
                 stdscr.attroff(curses.color_pair(1))
             else:
-                stdscr.addstr(y, 2, line[:cols-2])
-        
+                stdscr.addstr(y, 2, line[: cols - 2])
+
         stdscr.addstr(rows - 2, 2, "UP/DOWN navigate | ENTER/SPACE edit | q back")
         stdscr.refresh()
-        
+
         key = stdscr.getch()
-        if key in (ord('q'), ord('Q'), 27):
+        if key in (ord("q"), ord("Q"), 27):
             break
-        elif key in (curses.KEY_UP, ord('k')):
+        elif key in (curses.KEY_UP, ord("k")):
             selected = max(0, selected - 1)
-        elif key in (curses.KEY_DOWN, ord('j')):
+        elif key in (curses.KEY_DOWN, ord("j")):
             selected = min(len(display_entries) - 1, selected + 1)
-        elif key in (curses.KEY_ENTER, 10, 13, ord(' ')):
+        elif key in (curses.KEY_ENTER, 10, 13, ord(" ")):
             entry = display_entries[selected]
             if entry is None:
                 break
             if entry == "__SEPARATOR__":
-                continue
-            if entry == "__AUTO_DETECT__":
-                try:
-                    hardware = detect_hardware()
-                    recommendations = recommend_flags(hardware)
-                    text = Path(SERVICE_FILE).read_text()
-                    for key, val in recommendations.items():
-                        str_val = str(val).lower() if isinstance(val, bool) else str(val)
-                        text = write_setting(text, key, str_val)
-                    Path(SERVICE_FILE).write_text(text)
-                    current_settings = read_all_settings(text)
-                    show_message(stdscr, "Auto-Detect & Recommend", ["Settings applied!"] +
-                                 [f"  {k} = {v}" for k, v in recommendations.items()])
-                except Exception as e:
-                    show_message(stdscr, "Error", [f"Auto-detect failed: {e}"])
                 continue
             current_val = current_settings.get(entry.key, entry.default)
             try:
@@ -1142,10 +1682,18 @@ def run_auto_restart_settings(stdscr) -> None:
                         text = Path(SERVICE_FILE).read_text()
                         new_text = write_setting(text, entry.key, new_val)
                         Path(SERVICE_FILE).write_text(new_text)
-                        current_settings[entry.key] = int(new_val) if entry.type == "int" else new_val
-                        logging.info(f"Setting {entry.key} -> {new_val}")
+                        if new_val == "":
+                            current_settings[entry.key] = entry.default
+                            logging.info(f"Setting {entry.key} -> disabled")
+                        else:
+                            current_settings[entry.key] = (
+                                int(new_val) if entry.type == "int" else new_val
+                            )
+                            logging.info(f"Setting {entry.key} -> {new_val}")
             except Exception as e:
-                show_message(stdscr, "Settings Error", [f"Failed to save {entry.key}: {e}"])
+                show_message(
+                    stdscr, "Settings Error", [f"Failed to save {entry.key}: {e}"]
+                )
                 logging.error(f"Failed to save setting {entry.key}: {e}")
 
 
@@ -1153,22 +1701,49 @@ def run_ngl_retry_settings(stdscr) -> None:
     try:
         current = read_ngl_retry_settings(Path(SERVICE_FILE).read_text())
     except Exception as e:
-        show_message(stdscr, "Restart & Timeout Settings", [f"Failed to read service file: {e}"])
+        show_message(
+            stdscr, "Restart & Timeout Settings", [f"Failed to read service file: {e}"]
+        )
         return
-    ngl_start = _prompt_input(stdscr, "Restart & Timeout Settings", "Starting ngl value:", str(current["ngl_start"]))
+    ngl_start = _prompt_input(
+        stdscr,
+        "Restart & Timeout Settings",
+        "Starting ngl value:",
+        str(current["ngl_start"]),
+    )
     if ngl_start is None:
         return
-    ngl_step = _prompt_input(stdscr, "Restart & Timeout Settings", "ngl decrement per retry:", str(current["ngl_step"]))
+    ngl_step = _prompt_input(
+        stdscr,
+        "Restart & Timeout Settings",
+        "ngl decrement per retry:",
+        str(current["ngl_step"]),
+    )
     if ngl_step is None:
         return
     retry_default = "Y" if current["retry_on_oom"] else "n"
-    retry_on_oom = _prompt_input(stdscr, "Restart & Timeout Settings", "Retry with lower ngl after OOM crash? [Y/n]", retry_default)
+    retry_on_oom = _prompt_input(
+        stdscr,
+        "Restart & Timeout Settings",
+        "Retry with lower ngl after OOM crash? [Y/n]",
+        retry_default,
+    )
     if retry_on_oom is None:
         return
-    hang_timeout = _prompt_input(stdscr, "Restart & Timeout Settings", "Hang timeout (minutes):", str(current.get("hang_timeout_mins", 15)))
+    hang_timeout = _prompt_input(
+        stdscr,
+        "Restart & Timeout Settings",
+        "Hang timeout (minutes):",
+        str(current.get("hang_timeout_mins", 15)),
+    )
     if hang_timeout is None:
         return
-    oom_timeout = _prompt_input(stdscr, "Restart & Timeout Settings", "OOM detection timeout (seconds):", str(current.get("oom_detection_timeout_secs", 30)))
+    oom_timeout = _prompt_input(
+        stdscr,
+        "Restart & Timeout Settings",
+        "OOM detection timeout (seconds):",
+        str(current.get("oom_detection_timeout_secs", 30)),
+    )
     if oom_timeout is None:
         return
     try:
@@ -1181,26 +1756,48 @@ def run_ngl_retry_settings(stdscr) -> None:
         }
         save_ngl_retry_settings(settings)
         daemon_reload_if_needed()
-        logging.info(f"Recovery settings saved: ngl_start={settings['ngl_start']}, "
-                      f"step={settings['ngl_step']}, retry={settings['retry_on_oom']}, "
-                      f"hang_timeout={settings.get('hang_timeout_mins')}m, "
-                      f"oom_timeout={settings.get('oom_detection_timeout_secs')}s")
+        logging.info(
+            f"Recovery settings saved: ngl_start={settings['ngl_start']}, "
+            f"step={settings['ngl_step']}, retry={settings['retry_on_oom']}, "
+            f"hang_timeout={settings.get('hang_timeout_mins')}m, "
+            f"oom_timeout={settings.get('oom_detection_timeout_secs')}s"
+        )
     except Exception as e:
-        show_message(stdscr, "Restart & Timeout Settings", [f"Failed to save settings: {e}"])
+        show_message(
+            stdscr, "Restart & Timeout Settings", [f"Failed to save settings: {e}"]
+        )
         logging.error(f"Failed to save recovery settings: {e}")
         return
-    show_message(stdscr, "Restart & Timeout Settings", [
-        f"Saved starting ngl: {settings['ngl_start']}",
-        f"Saved decrement: {settings['ngl_step']}",
-        f"Retry on OOM: {'yes' if settings['retry_on_oom'] else 'no'}",
-        f"Hang timeout: {settings.get('hang_timeout_mins', 15)} min",
-        f"OOM detection: {settings.get('oom_detection_timeout_secs', 30)} sec",
-    ])
+    show_message(
+        stdscr,
+        "Restart & Timeout Settings",
+        [
+            f"Saved starting ngl: {settings['ngl_start']}",
+            f"Saved decrement: {settings['ngl_step']}",
+            f"Retry on OOM: {'yes' if settings['retry_on_oom'] else 'no'}",
+            f"Hang timeout: {settings.get('hang_timeout_mins', 15)} min",
+            f"OOM detection: {settings.get('oom_detection_timeout_secs', 30)} sec",
+        ],
+    )
 
 
 def _get_recent_logs(n: int = 10) -> List[str]:
     try:
-        out = _run(["journalctl", "-u", SERVICE_NAME, "-n", "100", "-o", "short-iso", "--show-cursor", "--no-pager"], capture_output=True, text=True).stdout
+        out = _run(
+            [
+                "journalctl",
+                "-u",
+                SERVICE_NAME,
+                "-n",
+                "100",
+                "-o",
+                "short-iso",
+                "--show-cursor",
+                "--no-pager",
+            ],
+            capture_output=True,
+            text=True,
+        ).stdout
         lines = [strip_journal_prefix(l) for l in out.strip().splitlines() if l.strip()]
         return [l for l in lines if l][-n:]
     except Exception:
@@ -1214,23 +1811,33 @@ def _start_service_with_ngl_retry(stdscr, action: str) -> None:
         Path(SERVICE_FILE).write_text(text)
         settings = read_ngl_retry_settings(text)
     except Exception as e:
-        show_message(stdscr, "Restart & Timeout Settings", [f"Failed to read service file: {e}"])
+        show_message(
+            stdscr, "Restart & Timeout Settings", [f"Failed to read service file: {e}"]
+        )
         return
     current_ngl = int(settings["ngl_start"])
     step = int(settings["ngl_step"])
     timeout_secs = int(settings.get("oom_detection_timeout_secs", 30))
-    logging.info(f"Service {action} starting: ngl={current_ngl}, step={step}, oom_timeout={timeout_secs}s")
+    logging.info(
+        f"Service {action} starting: ngl={current_ngl}, step={step}, oom_timeout={timeout_secs}s"
+    )
     while True:
         settings["ngl_start"] = current_ngl
         try:
             save_ngl_retry_settings(settings)
             _aggressive_service_action(action)
         except Exception as e:
-            show_message(stdscr, "Restart & Timeout Settings", [f"Failed to {action} service: {e}"])
+            show_message(
+                stdscr,
+                "Restart & Timeout Settings",
+                [f"Failed to {action} service: {e}"],
+            )
             logging.error(f"Service {action} failed: {e}")
             return
         if not settings.get("retry_on_oom", True):
-            logging.info(f"Service {action} completed (retry disabled), ngl={current_ngl}")
+            logging.info(
+                f"Service {action} completed (retry disabled), ngl={current_ngl}"
+            )
             return
         deadline = time.time() + timeout_secs
         saw_oom = False
@@ -1238,10 +1845,16 @@ def _start_service_with_ngl_retry(stdscr, action: str) -> None:
             if any(is_oom_like_failure(line) for line in _get_recent_logs(20)):
                 saw_oom = True
                 break
-            if _run(["systemctl", "is-active", "--quiet", SERVICE_NAME]).returncode == 0:
+            if (
+                _run(["systemctl", "is-active", "--quiet", SERVICE_NAME]).returncode
+                == 0
+            ):
                 # Service is running successfully
                 break
-            if _run(["systemctl", "is-failed", "--quiet", SERVICE_NAME]).returncode == 0:
+            if (
+                _run(["systemctl", "is-failed", "--quiet", SERVICE_NAME]).returncode
+                == 0
+            ):
                 time.sleep(0.5)
                 if any(is_oom_like_failure(line) for line in _get_recent_logs(20)):
                     saw_oom = True
@@ -1249,16 +1862,32 @@ def _start_service_with_ngl_retry(stdscr, action: str) -> None:
             time.sleep(0.5)
         if not saw_oom:
             # Check if service is actually running (not failed for other reasons)
-            if _run(["systemctl", "is-active", "--quiet", SERVICE_NAME]).returncode != 0:
-                show_message(stdscr, "Service Error", [f"Service failed to start (non-OOM error).", "Check journal for details."])
+            if (
+                _run(["systemctl", "is-active", "--quiet", SERVICE_NAME]).returncode
+                != 0
+            ):
+                show_message(
+                    stdscr,
+                    "Service Error",
+                    [
+                        "Service failed to start (non-OOM error).",
+                        "Check journal for details.",
+                    ],
+                )
                 logging.error(f"Service {action} failed (non-OOM error)")
                 return
             logging.info(f"Service {action} succeeded, ngl={current_ngl}")
             return
         next_ngl = next_retry_ngl(current_ngl, step)
-        logging.warning(f"OOM detected during {action}, retrying: ngl {current_ngl} -> {next_ngl}")
+        logging.warning(
+            f"OOM detected during {action}, retrying: ngl {current_ngl} -> {next_ngl}"
+        )
         if next_ngl == current_ngl:
-            show_message(stdscr, "Restart & Timeout Settings", [f"OOM retry stopped at ngl={current_ngl}."])
+            show_message(
+                stdscr,
+                "Restart & Timeout Settings",
+                [f"OOM retry stopped at ngl={current_ngl}."],
+            )
             logging.error(f"OOM retry exhausted: stuck at ngl={current_ngl}")
             return
         current_ngl = next_ngl
@@ -1292,33 +1921,56 @@ def draw_menu(stdscr, selected: int, rows: int, cols: int) -> None:
             pass
 
 
-
 def get_free_table():
     headers = ["Type", "Total", "Used", "Free", "Shared", "Buff/Cache", "Avail"]
     try:
         import subprocess
+
         out = subprocess.run(["free", "-b"], capture_output=True, text=True).stdout
         lines = out.strip().splitlines()
         rows = []
         for line in lines[1:]:
             parts = line.split()
-            if not parts: continue
-            label = parts[0].rstrip(':')
+            if not parts:
+                continue
+            label = parts[0].rstrip(":")
             nums = parts[1:]
             if label == "Mem" and len(nums) >= 6:
-                rows.append([label, _fmt_bytes(int(nums[0])), _fmt_bytes(int(nums[1])), _fmt_bytes(int(nums[2])), _fmt_bytes(int(nums[3])), _fmt_bytes(int(nums[4])), _fmt_bytes(int(nums[5]))])
+                rows.append(
+                    [
+                        label,
+                        _fmt_bytes(int(nums[0])),
+                        _fmt_bytes(int(nums[1])),
+                        _fmt_bytes(int(nums[2])),
+                        _fmt_bytes(int(nums[3])),
+                        _fmt_bytes(int(nums[4])),
+                        _fmt_bytes(int(nums[5])),
+                    ]
+                )
             elif label == "Swap" and len(nums) >= 2:
-                rows.append([label, _fmt_bytes(int(nums[0])), _fmt_bytes(int(nums[1])), _fmt_bytes(int(nums[2])) if len(nums) > 2 else "0B", "-", "-", "-"])
+                rows.append(
+                    [
+                        label,
+                        _fmt_bytes(int(nums[0])),
+                        _fmt_bytes(int(nums[1])),
+                        _fmt_bytes(int(nums[2])) if len(nums) > 2 else "0B",
+                        "-",
+                        "-",
+                        "-",
+                    ]
+                )
         return headers, rows
     except Exception:
         return headers, []
+
 
 def draw_free_h(stdscr, start_row: int, cols: int) -> int:
     try:
         stdscr.attron(curses.color_pair(COL_PURPLE) | curses.A_BOLD)
         stdscr.addstr(start_row, 0, " === MEMORY === "[:cols])
         stdscr.attroff(curses.color_pair(COL_PURPLE) | curses.A_BOLD)
-    except curses.error: pass
+    except curses.error:
+        pass
 
     headers, rows = get_free_table()
     col_w = [len(h) for h in headers]
@@ -1326,23 +1978,28 @@ def draw_free_h(stdscr, start_row: int, cols: int) -> int:
         for ci, cell in enumerate(row):
             col_w[ci] = max(col_w[ci], len(cell))
 
-    def fmt_row(cells): return "  ".join(c.rjust(col_w[i]) for i, c in enumerate(cells))
+    def fmt_row(cells):
+        return "  ".join(c.rjust(col_w[i]) for i, c in enumerate(cells))
+
     header_line = fmt_row(headers)
     data_lines = [fmt_row(r) for r in rows]
 
     try:
         stdscr.attron(curses.color_pair(COL_CYAN) | curses.A_BOLD)
-        stdscr.addstr(start_row + 1, 1, header_line[:cols - 2])
+        stdscr.addstr(start_row + 1, 1, header_line[: cols - 2])
         stdscr.attroff(curses.color_pair(COL_CYAN) | curses.A_BOLD)
-    except curses.error: pass
+    except curses.error:
+        pass
 
     for i, line in enumerate(data_lines):
         try:
             stdscr.attron(curses.color_pair(COL_NORMAL))
-            stdscr.addstr(start_row + 2 + i, 1, line[:cols - 2])
+            stdscr.addstr(start_row + 2 + i, 1, line[: cols - 2])
             stdscr.attroff(curses.color_pair(COL_NORMAL))
-        except curses.error: pass
+        except curses.error:
+            pass
     return start_row + 2 + len(data_lines)
+
 
 def run_watch(stdscr) -> None:
     try:
@@ -1355,45 +2012,55 @@ def run_watch(stdscr) -> None:
     stdscr.timeout(1000)
     while True:
         key = stdscr.getch()
-        if key in (ord('q'), ord('Q')): break
+        if key in (ord("q"), ord("Q")):
+            break
         stdscr.erase()
         rows, cols = stdscr.getmaxyx()
         draw_status_bar(stdscr, cols)
         next_row = draw_free_h(stdscr, 2, cols)
-        with lm.lock: logs = list(lm.raw_logs)[-watch_lines:]
+        with lm.lock:
+            logs = list(lm.raw_logs)[-watch_lines:]
         try:
             stdscr.attron(curses.color_pair(COL_PURPLE) | curses.A_BOLD)
             stdscr.addstr(next_row, 0, " === RECENT LOGS === "[:cols])
             stdscr.attroff(curses.color_pair(COL_PURPLE) | curses.A_BOLD)
-        except curses.error: pass
+        except curses.error:
+            pass
         for i, line in enumerate(logs):
             row = next_row + 1 + i
-            if row >= rows - 8: break
+            if row >= rows - 8:
+                break
             try:
                 stdscr.attron(curses.color_pair(COL_NORMAL))
-                stdscr.addstr(row, 1, strip_journal_prefix(line)[:cols - 2])
+                stdscr.addstr(row, 1, strip_journal_prefix(line)[: cols - 2])
                 stdscr.attroff(curses.color_pair(COL_NORMAL))
-            except curses.error: pass
+            except curses.error:
+                pass
         sep_row = next_row + 1 + len(logs) + 1
-        with gs.lock: slots = gs.slots
+        with gs.lock:
+            slots = gs.slots
         try:
             stdscr.attron(curses.color_pair(COL_PURPLE) | curses.A_BOLD)
             stdscr.addstr(sep_row, 0, " === SLOT PROGRESS === "[:cols])
             stdscr.attroff(curses.color_pair(COL_PURPLE) | curses.A_BOLD)
-        except curses.error: pass
+        except curses.error:
+            pass
         for i, (sid, sdata) in enumerate(slots.items()):
             row = sep_row + 1 + i
-            if row >= rows - 1: break
+            if row >= rows - 1:
+                break
             prog = sdata.get("prog", 0.0)
             task = sdata.get("task", "?")
             filled = int(prog * 20)
             bar = "#" * filled + "-" * (20 - filled)
-            text = f" Slot {sid} (Task {task}): [{bar}] {prog*100:.1f}%"
+            text = f" Slot {sid} (Task {task}): [{bar}] {prog * 100:.1f}%"
             try:
                 stdscr.attron(curses.color_pair(COL_NORMAL))
-                stdscr.addstr(row, 1, text[:cols - 2])
+                stdscr.addstr(row, 1, text[: cols - 2])
                 stdscr.attroff(curses.color_pair(COL_NORMAL))
-            except curses.error: pass
+            except curses.error:
+                pass
+
 
 def run_action(stdscr, action: str) -> None:
     if action == "watch":
@@ -1401,11 +2068,11 @@ def run_action(stdscr, action: str) -> None:
     elif action == "logs":
         run_logs(stdscr)
     elif action == "reset_error":
-        ngl_setting = next((s for s in SETTINGS if s.key == 'ngl_start'), None)
+        ngl_setting = next((s for s in SETTINGS if s.key == "ngl_start"), None)
         if ngl_setting is None:
             raise KeyError("ngl_start not found in SETTINGS")
         ngl_default = ngl_setting.default
-        ctx_setting = next((s for s in SETTINGS if s.key == 'ctx_start'), None)
+        ctx_setting = next((s for s in SETTINGS if s.key == "ctx_start"), None)
         if ctx_setting is None:
             raise KeyError("ctx_start not found in SETTINGS")
         ctx_default = ctx_setting.default
@@ -1417,32 +2084,50 @@ def run_action(stdscr, action: str) -> None:
             gs.last_log_ts = None
             gs.last_log_msg = ""
             gs.is_ready = False
-            _write_all_meta({
-                "oom_restart_count": "0",
-                "hang_recovery_count": "0",
-                "loop_restart_count": "0",
-                "last_recovery_reason": "",
-                "ngl_start": str(ngl_default),
-                "ctx_start": str(ctx_default),
-            })
-        logging.info("User action: reset_error, full recovery state reset (counters, ngl_start, ctx_start)")
-        show_message(stdscr, "Error Reset", [
-            "All recovery state has been reset:",
-            "",
-            "  • Critical error cleared",
-            "  • OOM detection counter reset",
-            "  • Loading state reset",
-            "  • Recovery counters reset to 0",
-            "  • ngl_start reset to {}".format(ngl_default),
-            "  • ctx_start reset to {}".format(ctx_default),
-            "",
-            "Press any key to return to menu.",
-        ], wait_key=True)
+            _write_all_meta(
+                {
+                    "oom_restart_count": "0",
+                    "hang_recovery_count": "0",
+                    "loop_restart_count": "0",
+                    "last_recovery_reason": "",
+                    "ngl_start": str(ngl_default),
+                    "ctx_start": str(ctx_default),
+                }
+            )
+        logging.info(
+            "User action: reset_error, full recovery state reset (counters, ngl_start, ctx_start)"
+        )
+        show_message(
+            stdscr,
+            "Error Reset",
+            [
+                "All recovery state has been reset:",
+                "",
+                "  • Critical error cleared",
+                "  • OOM detection counter reset",
+                "  • Loading state reset",
+                "  • Recovery counters reset to 0",
+                "  • ngl_start reset to {}".format(ngl_default),
+                "  • ctx_start reset to {}".format(ctx_default),
+                "",
+                "Press any key to return to menu.",
+            ],
+            wait_key=True,
+        )
     elif action == "auto_restart_settings":
         run_auto_restart_settings(stdscr)
     elif action == "start":
         logging.info("User action: start")
-        show_message(stdscr, "Starting Service", ["Starting llama.service with cache cleanup...", "", "This will take a few seconds."], wait_key=True)
+        show_message(
+            stdscr,
+            "Starting Service",
+            [
+                "Starting llama.service with cache cleanup...",
+                "",
+                "This will take a few seconds.",
+            ],
+            wait_key=True,
+        )
         daemon_reload_if_needed()
         _start_service_with_ngl_retry(stdscr, "start")
     elif action == "stop":
@@ -1451,13 +2136,32 @@ def run_action(stdscr, action: str) -> None:
         _run(["systemctl", "stop", SERVICE_NAME])
     elif action == "restart":
         logging.info("User action: restart")
-        show_message(stdscr, "Restarting Service", ["Restarting llama.service with cache cleanup...", "", "This will take a few seconds."], wait_key=True)
+        show_message(
+            stdscr,
+            "Restarting Service",
+            [
+                "Restarting llama.service with cache cleanup...",
+                "",
+                "This will take a few seconds.",
+            ],
+            wait_key=True,
+        )
         daemon_reload_if_needed()
         _start_service_with_ngl_retry(stdscr, "restart")
     elif action == "journal":
         curses.endwin()
         try:
-            subprocess.run(["journalctl", "-u", SERVICE_NAME, "-f", "-o", "short-iso", "--no-pager"])
+            subprocess.run(
+                [
+                    "journalctl",
+                    "-u",
+                    SERVICE_NAME,
+                    "-f",
+                    "-o",
+                    "short-iso",
+                    "--no-pager",
+                ]
+            )
         except KeyboardInterrupt:
             pass
         finally:
@@ -1468,15 +2172,15 @@ def main(stdscr) -> None:
     curses.curs_set(0)
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(COL_BAR,    curses.COLOR_WHITE,   92)
-    curses.init_pair(COL_SEL,    curses.COLOR_WHITE,   92)
-    curses.init_pair(COL_NORMAL, curses.COLOR_WHITE,   -1)
-    curses.init_pair(COL_GREEN,  curses.COLOR_GREEN,   -1)
-    curses.init_pair(COL_RED,    curses.COLOR_RED,     -1)
+    curses.init_pair(COL_BAR, curses.COLOR_WHITE, 92)
+    curses.init_pair(COL_SEL, curses.COLOR_WHITE, 92)
+    curses.init_pair(COL_NORMAL, curses.COLOR_WHITE, -1)
+    curses.init_pair(COL_GREEN, curses.COLOR_GREEN, -1)
+    curses.init_pair(COL_RED, curses.COLOR_RED, -1)
     curses.init_pair(COL_PURPLE, curses.COLOR_MAGENTA, -1)
-    curses.init_pair(COL_YELLOW, curses.COLOR_YELLOW,  -1)
-    curses.init_pair(COL_CYAN,   curses.COLOR_CYAN,    -1)
-    curses.init_pair(COL_SELBG,  curses.COLOR_BLACK,   curses.COLOR_WHITE)
+    curses.init_pair(COL_YELLOW, curses.COLOR_YELLOW, -1)
+    curses.init_pair(COL_CYAN, curses.COLOR_CYAN, -1)
+    curses.init_pair(COL_SELBG, curses.COLOR_BLACK, curses.COLOR_WHITE)
 
     threading.Thread(target=status_worker, daemon=True).start()
     lm.start()
@@ -1492,13 +2196,13 @@ def main(stdscr) -> None:
         stdscr.refresh()
 
         key = stdscr.getch()
-        if key in (ord('q'), ord('Q')):
+        if key in (ord("q"), ord("Q")):
             break
-        elif key in (curses.KEY_UP, ord('k')):
+        elif key in (curses.KEY_UP, ord("k")):
             selected = (selected - 1) % len(MENU)
-        elif key in (curses.KEY_DOWN, ord('j')):
+        elif key in (curses.KEY_DOWN, ord("j")):
             selected = (selected + 1) % len(MENU)
-        elif key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
+        elif key in (curses.KEY_ENTER, ord("\n"), ord("\r")):
             action = MENU[selected][1]
             if action == "quit":
                 break
@@ -1512,4 +2216,4 @@ if __name__ == "__main__":
         pass
     except Exception as e:
         logging.exception("Fatal error")
-        print(f"Fatal error: {e}", file=__import__('sys').stderr)
+        print(f"Fatal error: {e}", file=__import__("sys").stderr)

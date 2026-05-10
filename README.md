@@ -21,6 +21,7 @@ Zero external dependencies (uses Python stdlib only).
 ```bash
 sudo ./install.sh
 ```
+
 This will symlink the launcher to `/usr/local/bin/llama-manager` and optionally add the `llman` alias.
 
 ## Usage
