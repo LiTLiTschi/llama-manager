@@ -66,6 +66,14 @@ SETTINGS: List[Setting] = [
         description="Number of GPU layers to offload",
     ),
     Setting(
+        "model_path",
+        "Model Path (-m)",
+        "-m",
+        "string",
+        "",
+        description="Path to GGUF model file",
+    ),
+    Setting(
         "ngl_step",
         "NGL Decrement Per Retry",
         "",
@@ -265,14 +273,6 @@ SETTINGS: List[Setting] = [
         "int",
         0,
         description="Max parallel request slots (0=auto)",
-    ),
-    Setting(
-        "model_path",
-        "Model Path (-m)",
-        "-m",
-        "string",
-        "",
-        description="Path to GGUF model file",
     ),
     Setting(
         "no_kv_offload",
@@ -1732,38 +1732,42 @@ def run_auto_restart_settings(stdscr) -> None:
         stdscr.erase()
         rows, cols = stdscr.getmaxyx()
 
-        title = "=== Restart & Timeout Settings ==="
-        stdscr.attron(curses.color_pair(1))
+        # Compact header: 2 rows
+        title = "═══ Settings ═══"
+        stdscr.attron(curses.color_pair(COL_PURPLE) | curses.A_BOLD)
         stdscr.addstr(0, max(0, (cols - len(title)) // 2), title)
-        stdscr.attroff(curses.color_pair(1))
+        stdscr.attroff(curses.color_pair(COL_PURPLE) | curses.A_BOLD)
+        stdscr.addstr(1, 2, f"{'Setting':30s} {'Status':>15s}"[: cols - 2])
 
-        stdscr.addstr(2, 2, f"{'Setting':30s} {'Status':>15s}")
-        stdscr.addstr(3, 2, "-" * 48)
-
-        visible_count = min(rows - 6, len(display_entries))
-        start_idx = max(0, selected - visible_count // 2)
+        visible_count = max(1, min(rows - 5, len(display_entries)))
+        # Keep selection in view: center it in visible window
+        start_idx = max(0, min(selected - visible_count // 3, len(display_entries) - visible_count))
         end_idx = min(start_idx + visible_count, len(display_entries))
+        # Re-center if selection falls outside visible range
+        if selected < start_idx or selected >= end_idx:
+            start_idx = max(0, selected - visible_count // 2)
+            end_idx = min(start_idx + visible_count, len(display_entries))
 
         for i in range(start_idx, end_idx):
-            y = 4 + i - start_idx
+            y = 2 + i - start_idx
             entry = display_entries[i]
 
             if entry is None:
                 indicator = " <-" if i == selected else "   "
-                stdscr.addstr(y, 2, f"[q] Back to main menu{indicator}")
+                stdscr.addstr(y, 2, f"[q] Back to main menu{indicator}"[: cols - 2])
                 continue
 
             if entry == "__SEPARATOR__":
-                stdscr.addstr(y, 2, "─" * 48)
+                stdscr.addstr(y, 2, "─" * min(48, cols - 3))
                 continue
 
             if entry == "__AUTO_DETECT__":
                 cursor = ">" if i == selected else " "
                 line = f"{cursor}   ⚡ Auto-Detect & Recommend"
                 if i == selected:
-                    stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+                    stdscr.attron(curses.color_pair(COL_SEL) | curses.A_BOLD)
                     stdscr.addstr(y, 2, line[: cols - 2])
-                    stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+                    stdscr.attroff(curses.color_pair(COL_SEL) | curses.A_BOLD)
                 else:
                     stdscr.attron(curses.color_pair(COL_GREEN))
                     stdscr.addstr(y, 2, line[: cols - 2])
@@ -1787,12 +1791,13 @@ def run_auto_restart_settings(stdscr) -> None:
 
             checkbox = "[X]" if is_enabled else "[ ]"
             cursor = ">" if i == selected else " "
-            line = f"{cursor} {checkbox} {entry.key:28s} {display_val:>14s}"
+            label = entry.label if hasattr(entry, 'label') else entry.key
+            line = f"{cursor} {checkbox} {label:28s} {display_val:>14s}"
 
             if i == selected:
-                stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+                stdscr.attron(curses.color_pair(COL_SEL) | curses.A_BOLD)
                 stdscr.addstr(y, 2, line[: cols - 2])
-                stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+                stdscr.attroff(curses.color_pair(COL_SEL) | curses.A_BOLD)
             elif not is_enabled:
                 stdscr.attron(curses.color_pair(COL_GREY))
                 stdscr.addstr(y, 2, line[: cols - 2])
@@ -1800,7 +1805,10 @@ def run_auto_restart_settings(stdscr) -> None:
             else:
                 stdscr.addstr(y, 2, line[: cols - 2])
 
-        stdscr.addstr(rows - 2, 2, "UP/DOWN nav | ENTER edit | SPACE toggle | q back")
+        # Help bar with page indicator
+        pct = f"{selected + 1}/{len(display_entries)}"
+        help_text = f"PgUp/PgDn page | ↑↓/jk nav | ENTER edit | SPACE toggle | q back  [{pct}]"
+        stdscr.addstr(rows - 1, 2, help_text[: cols - 2])
         stdscr.refresh()
 
         key = stdscr.getch()
@@ -1810,6 +1818,14 @@ def run_auto_restart_settings(stdscr) -> None:
             selected = max(0, selected - 1)
         elif key in (curses.KEY_DOWN, ord("j")):
             selected = min(len(display_entries) - 1, selected + 1)
+        elif key in (curses.KEY_PPAGE, ord("K")):
+            selected = max(0, selected - visible_count)
+        elif key in (curses.KEY_NPAGE, ord("J")):
+            selected = min(len(display_entries) - 1, selected + visible_count)
+        elif key in (curses.KEY_HOME, ord("g")):
+            selected = 0
+        elif key in (curses.KEY_END, ord("G")):
+            selected = len(display_entries) - 1
         elif key in (curses.KEY_ENTER, 10, 13):
             if _apply_setting_change(
                 stdscr, display_entries, selected, current_settings, use_toggle=False
