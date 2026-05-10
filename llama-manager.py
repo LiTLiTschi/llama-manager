@@ -1367,7 +1367,8 @@ def remove_stale_flags(text: str) -> str:
     COL_YELLOW,
     COL_CYAN,
     COL_SELBG,
-) = range(1, 10)
+    COL_GREY,
+) = range(1, 11)
 
 
 def draw_status_bar(stdscr, cols):
@@ -1549,34 +1550,101 @@ def _prompt_input(stdscr, title: str, prompt: str, initial: str = "") -> Optiona
         stdscr.timeout(1000)
 
 
-def _prompt_setting(stdscr, setting: Setting, current_value: Any) -> Optional[str]:
-    """Prompt user for a new value for a setting."""
+def _get_gguf_files() -> tuple[List[str], List[str]]:
+    """Return sorted list of .gguf basenames from GGUF_DIR with full paths."""
+    if not GGUF_DIR.is_dir():
+        return [], []
+    paths = sorted(GGUF_DIR.glob("*.gguf"))
+    return [p.name for p in paths], [str(p) for p in paths]
+
+
+def _toggle_setting(stdscr, setting: Setting, current_value: Any) -> str:
+    """SPACE toggle: enable/disable, cycle enum, or cycle gguf files. No input prompt."""
+    cv = str(current_value)
     if setting.type == "bool":
-        new_val = (
-            "false" if str(current_value).lower() in ("true", "1", "yes") else "true"
-        )
+        new_val = "false" if cv.lower() in ("true", "1", "yes") else "true"
+    elif setting.type == "enum":
+        options = setting.options
+        if not options:
+            return cv
+        current_idx = options.index(cv) if cv in options else 0
+        new_idx = (current_idx + 1) % len(options)
+        new_val = options[new_idx]
+    elif setting.key == "model_path":
+        # Cycle through .gguf files in ~/.gguf
+        names, paths = _get_gguf_files()
+        if not names:
+            # No gguf files found — simple toggle
+            new_val = str(setting.default) if cv == "" else ""
+        else:
+            current_basename = Path(cv).name if cv else ""
+            if current_basename in names:
+                idx = names.index(current_basename)
+                if idx + 1 < len(names):
+                    new_val = paths[idx + 1]
+                else:
+                    new_val = ""  # past last → disable
+            else:
+                new_val = paths[0]  # first file
+    else:
+        # int/string: toggle between disabled (empty) and enabled (default)
+        if cv == "":
+            new_val = str(setting.default)
+        else:
+            new_val = ""
+    # Visual feedback
+    if setting.key == "model_path" and new_val:
+        display = Path(new_val).name
+    else:
+        display = _format_display_val(setting, new_val)
+    stdscr.erase()
+    stdscr.addstr(0, 0, f"  {setting.label}: {display}  ")
+    stdscr.clrtoeol()
+    stdscr.refresh()
+    curses.napms(500)
+    return new_val
+
+
+def _format_display_val(setting: Setting, value: str) -> str:
+    """Format a setting value for display (enabled/disabled for bools, etc)."""
+    if setting.type == "bool":
+        return "enabled" if str(value).lower() in ("true", "1", "yes") else "disabled"
+    if value == "":
+        return "disabled"
+    return value
+
+
+def _prompt_setting(stdscr, setting: Setting, current_value: Any) -> Optional[str]:
+    """ENTER: edit a setting (toggle for bool/enum, input prompt for int/string)."""
+    cv = str(current_value)
+    if setting.type == "bool":
+        new_val = "false" if cv.lower() in ("true", "1", "yes") else "true"
+        display = _format_display_val(setting, new_val)
+        stdscr.erase()
+        stdscr.addstr(0, 0, f"  {setting.label}: {display}  ")
+        stdscr.clrtoeol()
+        stdscr.refresh()
+        curses.napms(500)
         return new_val
     elif setting.type == "int":
         return _prompt_input(
             stdscr,
             "Restart & Timeout Settings",
             f"Enter new {setting.key} (empty=disable):",
-            str(current_value),
+            cv,
         )
     elif setting.type == "string":
         return _prompt_input(
             stdscr,
             setting.label,
             setting.label + " (empty=disable):",
-            str(current_value),
+            cv,
         )
     elif setting.type == "enum":
         options = setting.options
         if not options:
-            return str(current_value)
-        current_idx = (
-            options.index(str(current_value)) if str(current_value) in options else 0
-        )
+            return cv
+        current_idx = options.index(cv) if cv in options else 0
         new_idx = (current_idx + 1) % len(options)
         new_value = options[new_idx]
         # Visual feedback for cycling
@@ -1586,7 +1654,44 @@ def _prompt_setting(stdscr, setting: Setting, current_value: Any) -> Optional[st
         stdscr.refresh()
         curses.napms(500)
         return new_value
-    return str(current_value)
+    return cv
+
+
+def _apply_setting_change(
+    stdscr, display_entries, selected, current_settings, *, use_toggle=False
+):
+    """Apply a setting change: toggle (SPACE) or edit prompt (ENTER)."""
+    entry = display_entries[selected]
+    if entry is None:
+        return True  # signal to break
+    if entry == "__SEPARATOR__":
+        return False
+    current_val = current_settings.get(entry.key, entry.default)
+    try:
+        if use_toggle:
+            new_val = _toggle_setting(stdscr, entry, current_val)
+        else:
+            new_val = _prompt_setting(stdscr, entry, current_val)
+        if new_val is None:
+            return False
+        text = Path(SERVICE_FILE).read_text()
+        new_text = write_setting(text, entry.key, new_val)
+        Path(SERVICE_FILE).write_text(new_text)
+        if new_val == "":
+            current_settings[entry.key] = ""
+            logging.info(f"Setting {entry.key} -> disabled")
+        elif entry.type == "bool":
+            current_settings[entry.key] = _parse_bool(new_val)
+            logging.info(f"Setting {entry.key} -> {new_val}")
+        else:
+            current_settings[entry.key] = (
+                int(new_val) if entry.type == "int" else new_val
+            )
+            logging.info(f"Setting {entry.key} -> {new_val}")
+    except Exception as e:
+        show_message(stdscr, "Settings Error", [f"Failed to save {entry.key}: {e}"])
+        logging.error(f"Failed to save setting {entry.key}: {e}")
+    return False
 
 
 def run_auto_restart_settings(stdscr) -> None:
@@ -1611,7 +1716,7 @@ def run_auto_restart_settings(stdscr) -> None:
         stdscr.addstr(0, max(0, (cols - len(title)) // 2), title)
         stdscr.attroff(curses.color_pair(1))
 
-        stdscr.addstr(2, 2, f"{'Setting':30s} {'Value':>15s}")
+        stdscr.addstr(2, 2, f"{'Setting':30s} {'Status':>15s}")
         stdscr.addstr(3, 2, "-" * 48)
 
         visible_count = min(rows - 6, len(display_entries))
@@ -1633,24 +1738,35 @@ def run_auto_restart_settings(stdscr) -> None:
 
             current_str = str(current_settings.get(entry.key, entry.default))
             if entry.type == "bool":
-                display_val = (
-                    "enabled"
-                    if str(current_str).lower() in ("true", "1", "yes")
-                    else "disabled"
-                )
+                is_enabled = str(current_str).lower() in ("true", "1", "yes")
+                display_val = "enabled" if is_enabled else "disabled"
             else:
-                display_val = current_str
+                is_enabled = current_str != ""
+                if current_str != "":
+                    display_val = (
+                        Path(current_str).name
+                        if entry.key == "model_path"
+                        else current_str
+                    )
+                else:
+                    display_val = "disabled"
 
-            prefix = " > " if i == selected else "   "
-            line = f"{prefix}{entry.key:30s} {display_val:>15s}"
+            checkbox = "[X]" if is_enabled else "[ ]"
+            cursor = ">" if i == selected else " "
+            line = f"{cursor} {checkbox} {entry.key:28s} {display_val:>14s}"
+
             if i == selected:
-                stdscr.attron(curses.color_pair(1))
+                stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
                 stdscr.addstr(y, 2, line[: cols - 2])
-                stdscr.attroff(curses.color_pair(1))
+                stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+            elif not is_enabled:
+                stdscr.attron(curses.color_pair(COL_GREY))
+                stdscr.addstr(y, 2, line[: cols - 2])
+                stdscr.attroff(curses.color_pair(COL_GREY))
             else:
                 stdscr.addstr(y, 2, line[: cols - 2])
 
-        stdscr.addstr(rows - 2, 2, "UP/DOWN navigate | ENTER/SPACE edit | q back")
+        stdscr.addstr(rows - 2, 2, "UP/DOWN nav | ENTER edit | SPACE toggle | q back")
         stdscr.refresh()
 
         key = stdscr.getch()
@@ -1660,41 +1776,16 @@ def run_auto_restart_settings(stdscr) -> None:
             selected = max(0, selected - 1)
         elif key in (curses.KEY_DOWN, ord("j")):
             selected = min(len(display_entries) - 1, selected + 1)
-        elif key in (curses.KEY_ENTER, 10, 13, ord(" ")):
-            entry = display_entries[selected]
-            if entry is None:
+        elif key in (curses.KEY_ENTER, 10, 13):
+            if _apply_setting_change(
+                stdscr, display_entries, selected, current_settings, use_toggle=False
+            ):
                 break
-            if entry == "__SEPARATOR__":
-                continue
-            current_val = current_settings.get(entry.key, entry.default)
-            try:
-                if entry.type == "bool":
-                    new_val = _prompt_setting(stdscr, entry, current_val)
-                    if new_val is not None:
-                        text = Path(SERVICE_FILE).read_text()
-                        new_text = write_setting(text, entry.key, new_val)
-                        Path(SERVICE_FILE).write_text(new_text)
-                        current_settings[entry.key] = _parse_bool(new_val)
-                        logging.info(f"Setting {entry.key} -> {new_val}")
-                else:
-                    new_val = _prompt_setting(stdscr, entry, current_val)
-                    if new_val is not None:
-                        text = Path(SERVICE_FILE).read_text()
-                        new_text = write_setting(text, entry.key, new_val)
-                        Path(SERVICE_FILE).write_text(new_text)
-                        if new_val == "":
-                            current_settings[entry.key] = entry.default
-                            logging.info(f"Setting {entry.key} -> disabled")
-                        else:
-                            current_settings[entry.key] = (
-                                int(new_val) if entry.type == "int" else new_val
-                            )
-                            logging.info(f"Setting {entry.key} -> {new_val}")
-            except Exception as e:
-                show_message(
-                    stdscr, "Settings Error", [f"Failed to save {entry.key}: {e}"]
-                )
-                logging.error(f"Failed to save setting {entry.key}: {e}")
+        elif key == ord(" "):
+            if _apply_setting_change(
+                stdscr, display_entries, selected, current_settings, use_toggle=True
+            ):
+                break
 
 
 def run_ngl_retry_settings(stdscr) -> None:
@@ -2181,6 +2272,7 @@ def main(stdscr) -> None:
     curses.init_pair(COL_YELLOW, curses.COLOR_YELLOW, -1)
     curses.init_pair(COL_CYAN, curses.COLOR_CYAN, -1)
     curses.init_pair(COL_SELBG, curses.COLOR_BLACK, curses.COLOR_WHITE)
+    curses.init_pair(COL_GREY, 8, -1)  # dark grey for disabled entries
 
     threading.Thread(target=status_worker, daemon=True).start()
     lm.start()
